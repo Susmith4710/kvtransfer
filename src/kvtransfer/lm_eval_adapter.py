@@ -331,3 +331,11 @@ def run_harness(source: str, target: str, mapper: str, tasks: Sequence[str] | st
     )
     table = retention_table(res_xfer["results"], res_target["results"], res_source["results"], metric=metric)
     return {"target": res_target, "source": res_source, "transfer": res_xfer, "retention": table}
+
+
+def retention_summary(rows: list[dict]) -> dict:
+    """Paper Table 1 aggregates: Avg = mean retention, Avg_fn = mean floor-normalized retention over tasks."""
+    ret = [r["retention_pct"] for r in rows if r.get("retention_pct") is not None]
+    fn = [r["normalized_retention_pct"] for r in rows if r.get("normalized_retention_pct") is not None]
+    return {"n_tasks": len(rows), "avg_retention_pct": (sum(ret) / len(ret)) if ret else None,
+            "avg_floor_normalized_pct": (sum(fn) / len(fn)) if fn else None}

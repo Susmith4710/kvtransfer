@@ -94,10 +94,12 @@ class CrossModelTransfer:
                 nxt = torch.where(finished, torch.full_like(nxt, eos_token_id), nxt)
                 finished |= nxt == eos_token_id
             seq = torch.cat([seq, nxt[:, None]], dim=1)
-            if eos_token_id is not None and bool(finished.all()):
-                break
+            # always run the chosen token through the model, EOS included, so the cache covers every
+            # token in `seq` (a shorter cache would silently misalign later positions)
             out = forward_with_cache(self.target, cache, nxt[:, None], past_len=seq.shape[1] - 1)
             logits, cache = out.logits, out.past_key_values
+            if eos_token_id is not None and bool(finished.all()):
+                break
         return TransferResult(seq, T, T - hold_back, cache)
 
 
@@ -175,9 +177,9 @@ class Session:
             nxt = logits.argmax(-1)
             new.append(nxt)
             self.tokens = torch.cat([self.tokens, nxt[:, None].to(self.device)], dim=1)
+            out = forward_with_cache(self.model, self.cache, nxt[:, None], past_len=self.tokens.shape[1] - 1)
+            logits, self.cache = out.logits[:, -1], out.past_key_values   # cache now covers all tokens
             if eos_token_id is not None and bool((nxt == eos_token_id).all()):
                 break
-            out = forward_with_cache(self.model, self.cache, nxt[:, None], past_len=self.tokens.shape[1] - 1)
-            logits, self.cache = out.logits[:, -1], out.past_key_values
         self.last_logits = logits
         return torch.stack(new, dim=1)

@@ -89,10 +89,13 @@ class Mapper:
             rows = stats.src_rows(selected[lt].tolist())
             cols = stats.tgt_cols(lt)
             for kind in ("K", "V"):
-                w, b, r2 = stats.acc[k_kind if kind == "K" else "V"].solve(lam, rows=rows, cols=cols, solve_dtype=solve_dtype)
+                acc = stats.acc[k_kind if kind == "K" else "V"]
+                w, b, _pooled = acc.solve(lam, rows=rows, cols=cols, solve_dtype=solve_dtype)
                 (m.W_K if kind == "K" else m.W_V).append(w.float().cpu())
                 (m.b_K if kind == "K" else m.b_V).append(b.float().cpu())
-                r2s[kind].append(r2)
+                # paper reports head-averaged R^2 (Table 7 / App. B), not pooled over the layer's columns
+                per_head = acc.block_r2(*acc.last_column_residuals, block=stats.target.head_dim)
+                r2s[kind].append(float(np.nanmean(per_head)))
             if progress:
                 print(f"[fit] target layer {lt}: src {selected[lt].tolist()} R2 K={r2s['K'][-1]:.3f} V={r2s['V'][-1]:.3f}",
                       flush=True)
@@ -110,8 +113,9 @@ class Mapper:
         wdt = self.W_K[0].dtype
         out_dtype = out_dtype or src_kvs[0][0].dtype
         needed = sorted(set(int(x) for x in self.selected.flatten()))
+        # RoPE strip / re-apply always in fp32 (the paper's regime), the matmul in the mapper's dtype
         if self.key_space in ("content", "content-norerotate"):
-            k_content = {l: src_codec.strip(src_kvs[l][0].to(wdt), positions).permute(0, 2, 1, 3).reshape(B, T, n_kv * d)
+            k_content = {l: src_codec.strip(src_kvs[l][0].float(), positions).to(wdt).permute(0, 2, 1, 3).reshape(B, T, n_kv * d)
                          for l in needed}
         else:
             k_content = {l: src_kvs[l][0].to(wdt).permute(0, 2, 1, 3).reshape(B, T, n_kv * d) for l in needed}
@@ -124,7 +128,7 @@ class Mapper:
             xv = torch.cat([v_src[l] for l in layers], dim=-1)
             k_hat = (xk @ self.W_K[lt].to(dev) + self.b_K[lt].to(dev)).reshape(B, T, tw, td).permute(0, 2, 1, 3)
             if self.key_space == "content":
-                k_hat = tgt_codec.apply(k_hat, positions)
+                k_hat = tgt_codec.apply(k_hat.float(), positions)
             v_hat = (xv @ self.W_V[lt].to(dev) + self.b_V[lt].to(dev)).reshape(B, T, tw, td).permute(0, 2, 1, 3)
             out.append((k_hat.to(out_dtype).contiguous(), v_hat.to(out_dtype).contiguous()))
         return out
@@ -134,6 +138,9 @@ class Mapper:
                     target_model=None, out_dtype=None):
         """Map a source ``DynamicCache`` (first ``n_tokens`` positions) into a target ``DynamicCache``."""
         n_layers = cache_num_layers(src_cache)
+        dev0 = cache_layer(src_cache, 0)[0].device
+        if self.W_K and self.W_K[0].device != dev0:
+            self.to(device=dev0)
         kvs = []
         for l in range(n_layers):
             k, v = cache_layer(src_cache, l)

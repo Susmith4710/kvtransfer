@@ -2,8 +2,9 @@
 
 * ``cache_r2``: held-out reconstruction R^2 per target layer for K (content space) and V.
 * ``attention_output_cosine``: cosine between the attention output the target computes from the
-  *mapped* prefix cache and from its *own* prefix cache, on the same suffix tokens.  The paper finds
-  this predicts downstream retention (r=+0.57) where R^2 does not (r=-0.20).
+  *mapped* prefix cache and from its *own* prefix cache, on the same suffix tokens, computed per
+  attention head and averaged over heads, tokens and layers (paper Sec. 4.5: "averaged over layers
+  and heads").  The paper finds this predicts downstream retention (r=+0.57) where R^2 does not.
 * ``logit_divergence``: KL(p_own || p_mapped) and top-1 agreement on the suffix tokens.
 
 All three share the same protocol: the prompt is split into a prefix (mapped) and a suffix that
@@ -56,8 +57,10 @@ class _AttnOutputTap:
     def __init__(self, model):
         self.outs = {}
         self.handles = []
+        self.head_dim = {}
         for i, layer in enumerate(decoder_layers(model)):
             proj = layer.self_attn.o_proj
+            self.head_dim[i] = int(getattr(layer.self_attn, "head_dim", 0) or 0)
             self.handles.append(proj.register_forward_pre_hook(self._hook(i)))
 
     def _hook(self, i):
@@ -104,9 +107,12 @@ def evaluate(source_model, target_model, mapper: Mapper, sequences, prefix_len: 
         for l in range(Lt):
             k_own, v_own = cache_layer(own_cache, l)
             k_hat, v_hat = mapped[l]
-            k_own_c = tgt_codec.strip(k_own.float(), pos.to(tgt_dev)).reshape(-1, mapper.target.head_dim)
-            k_hat_c = tgt_codec.strip(k_hat.float().to(tgt_dev), pos.to(tgt_dev)).reshape(-1, mapper.target.head_dim)
-            r2k[l] += r2_score(k_own_c, k_hat_c)
+            if mapper.key_space == "content-norerotate":
+                r2k[l] += float("nan")          # mapped keys are un-rotated on purpose; R2 in cache space is meaningless
+            else:
+                k_own_c = tgt_codec.strip(k_own.float(), pos.to(tgt_dev)).reshape(-1, mapper.target.head_dim)
+                k_hat_c = tgt_codec.strip(k_hat.float().to(tgt_dev), pos.to(tgt_dev)).reshape(-1, mapper.target.head_dim)
+                r2k[l] += r2_score(k_own_c, k_hat_c)
             r2v[l] += r2_score(v_own.float().reshape(-1, mapper.target.head_dim),
                                v_hat.float().to(tgt_dev).reshape(-1, mapper.target.head_dim))
 
@@ -122,7 +128,9 @@ def evaluate(source_model, target_model, mapper: Mapper, sequences, prefix_len: 
         map_attn = dict(tap.outs)
         tap.close()
         for l in range(Lt):
-            a, b = own_attn[l].reshape(-1, own_attn[l].shape[-1]), map_attn[l].reshape(-1, map_attn[l].shape[-1])
+            d = tap.head_dim.get(l) or mapper.target.head_dim
+            a = own_attn[l].reshape(-1, own_attn[l].shape[-1] // d, d)   # [tokens, heads, d_h]
+            b = map_attn[l].reshape(-1, map_attn[l].shape[-1] // d, d)
             cos[l] += float(torch.nn.functional.cosine_similarity(a, b, dim=-1).mean())
         lp_own = torch.log_softmax(out_own.logits.float(), -1)
         lp_map = torch.log_softmax(out_map.logits.float(), -1)

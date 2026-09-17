@@ -234,7 +234,7 @@ def cmd_experiment(args):
         eval_seq_len=args.eval_seq_len, eval_suffix_len=args.eval_suffix_len,
         bench_seq_lens=tuple(int(x) for x in args.bench_seq_lens.split(",")), bench_warmup=args.bench_warmup,
         bench_trials=args.bench_trials, multiturn_turns=args.turns, multiturn_turn_tokens=args.turn_tokens,
-        ablation=not args.no_ablation, device=args.device, dtype=args.dtype, attn=args.attn, hardware=args.hardware,
+        ablation=not args.no_ablation, reverse=not args.no_reverse, device=args.device, dtype=args.dtype, attn=args.attn, hardware=args.hardware,
         stats_device=args.stats_device, force=args.force, allow_mismatched=args.allow_mismatched,
         trust_remote_code=args.trust_remote_code, stages=tuple(args.stages.split(",")),
     )
@@ -255,7 +255,7 @@ def cmd_serve(args):
 
 
 def cmd_harness(args):
-    from .lm_eval_adapter import run_harness
+    from .lm_eval_adapter import retention_summary, run_harness
     res = run_harness(args.source, args.target, args.mapper, tasks=args.tasks.split(","), device=args.device or "cuda",
                       dtype=args.dtype or "auto", limit=args.limit, hold_back=args.hold_back,
                       num_fewshot=args.num_fewshot, batch_size=args.batch_size)
@@ -270,8 +270,12 @@ def cmd_harness(args):
     for r in rows:
         print(f"{r['task']:22} {r['metric']:22} {f(r['source'])} {f(r['target'])} {f(r['transfer'], 8)} "
               f"{pct(r['retention_pct'], 9)} {pct(r['normalized_retention_pct'], 10)}")
+    summ = retention_summary(rows)
+    a, b = summ["avg_retention_pct"], summ["avg_floor_normalized_pct"]
+    print(f"Avg retention {a if a is None else f'{a:.1f}%'}   Avg floor-normalized {b if b is None else f'{b:.1f}%'}   (paper Table 1 aggregates)")
     if args.out:
-        Path(args.out).write_text(json.dumps({k: (v if k == "retention" else v.get("results")) for k, v in res.items()}, indent=2, default=str))
+        Path(args.out).write_text(json.dumps({k: (v if k == "retention" else v.get("results")) for k, v in res.items()} | {"summary": summ},
+                                             indent=2, default=str))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -371,9 +375,10 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--eval-n-seqs", type=int, default=32)
     ex.add_argument("--eval-seq-len", type=int, default=1024)
     ex.add_argument("--eval-suffix-len", type=int, default=32)
-    ex.add_argument("--bench-seq-lens", default="64,256,1024,4096,8192,32768")
-    ex.add_argument("--bench-warmup", type=int, default=5)
-    ex.add_argument("--bench-trials", type=int, default=10)
+    ex.add_argument("--bench-seq-lens", default="64,128,256,512,1024,2048,4096,8192,16384,32768")
+    ex.add_argument("--bench-warmup", type=int, default=50)
+    ex.add_argument("--bench-trials", type=int, default=30)
+    ex.add_argument("--no-reverse", action="store_true", help="skip the target->source calibration (L->S eval, alternating multi-turn)")
     ex.add_argument("--turns", type=int, default=10)
     ex.add_argument("--turn-tokens", type=int, default=64)
     ex.add_argument("--no-ablation", action="store_true")
@@ -381,7 +386,7 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--stats-device", default=None)
     ex.add_argument("--force", action="store_true", help="run even if the plan says it does not fit")
     ex.add_argument("--allow-mismatched", action="store_true", help="mismatched-KV pair (research extension beyond the paper)")
-    ex.add_argument("--stages", default="plan,calibrate,fit,eval,ablation,bench,multiturn,report")
+    ex.add_argument("--stages", default="plan,calibrate,fit,eval,ablation,reverse,bench,multiturn,report")
     ex.set_defaults(fn=cmd_experiment)
 
     sv = sub.add_parser("serve", help="escalation server: small model answers, large model continues from the mapped cache")

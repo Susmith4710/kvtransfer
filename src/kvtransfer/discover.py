@@ -18,7 +18,8 @@ from typing import Iterable
 
 from .hardware import ModelCost, estimate_params
 
-# Pairs the paper evaluated (Table 1), for annotating what is known.  Values: avg retention %.
+# Ordered pairs the paper evaluated, for annotating what is known.  Small-to-large: Table 1 (five
+# benchmarks).  Large-to-small: HellaSwag only (Sec. 4.2, 4.5), with the numbers the paper states.
 PAPER_PAIRS = {
     ("Qwen3-14B", "Qwen3-32B"): "paper Tier 1: 97.6 % avg retention (k=8)",
     ("Qwen3-8B", "Qwen3-32B"): "paper Tier 1: 87.5 % avg retention (k=12)",
@@ -26,6 +27,9 @@ PAPER_PAIRS = {
     ("Ministral-3-3B", "Ministral-3-8B"): "paper Tier 1: 76.2 % avg retention (k=all)",
     ("Ministral-3-3B", "Ministral-3-14B"): "paper Tier 2: 44.2 % avg retention, ridge fails (MLP recovers)",
     ("Ministral-3-8B", "Ministral-3-14B"): "paper Tier 2: 41.6 % avg retention, ridge fails (MLP recovers)",
+    ("Qwen3-32B", "Qwen3-14B"): "paper L->S: evaluated on HellaSwag and multi-turn CoQA (k=20), drift 0.33 pp/turn",
+    ("Llama-3.1-70B", "Llama-3.1-8B"): "paper L->S: 37 % HellaSwag retention (HellaSwag only)",
+    ("Ministral-3-8B", "Ministral-3-3B"): "paper L->S: 93 % HellaSwag retention (HellaSwag only)",
 }
 
 # Ollama tag -> Hugging Face id (bf16 safetensors), for the models a typical Ollama box holds.
@@ -102,12 +106,16 @@ def _hub_cache_dirs() -> list[Path]:
 
 def _snapshot_dirs(root: Path) -> Iterable[tuple[str, Path]]:
     """Yield (name, dir) for every directory holding a config.json under ``root`` (hub cache aware)."""
-    if not root.exists():
+    if not root.is_dir():
         return
     if (root / "config.json").exists():
         yield root.name, root
         return
-    for d in sorted(root.iterdir()):
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return
+    for d in entries:
         if not d.is_dir():
             continue
         if d.name.startswith("models--"):
@@ -120,7 +128,11 @@ def _snapshot_dirs(root: Path) -> Iterable[tuple[str, Path]]:
         elif (d / "config.json").exists():
             yield d.name, d
         else:  # one level deeper (e.g. models/qwen/Qwen3-8B)
-            for dd in sorted(d.iterdir()):
+            try:
+                sub = sorted(d.iterdir())
+            except OSError:
+                continue
+            for dd in sub:
                 if dd.is_dir() and (dd / "config.json").exists():
                     yield f"{d.name}/{dd.name}", dd
 
@@ -302,7 +314,7 @@ def enumerate_pairs(models: list[ModelInfo]) -> list[PairInfo]:
                 continue
             direction = "small->large" if a.n_params <= b.n_params else "large->small"
             pairs.append(PairInfo(a, b, b.n_layers / a.n_layers, (b.n_params / a.n_params) if a.n_params else float("nan"),
-                                  direction, _paper_note(a, b) or _paper_note(b, a)))
+                                  direction, _paper_note(a, b)))
     pairs.sort(key=lambda p: (p.direction != "small->large", abs(p.depth_ratio - 1.0), p.param_ratio))
     return pairs
 

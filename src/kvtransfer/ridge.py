@@ -93,13 +93,24 @@ class MomentAccumulator:
             w = torch.linalg.solve(a, gxy)
         except RuntimeError:
             w = torch.linalg.lstsq(a, gxy).solution
-        # SS_res = tr(YcᵀYc) - 2 tr(Wᵀ XcᵀYc) + tr(Wᵀ XcᵀXc W)
+        # per-column SS_res_c = syy_c - 2 (Wᵀ XcᵀYc)_cc + (Wᵀ XcᵀXc W)_cc ; pooled R^2 sums the columns
+        ss_res_c = syy.double() - 2.0 * (w * gxy).sum(0) + (w * (gxx @ w)).sum(0)
         ss_tot = float(syy.double().sum())
-        ss_res = ss_tot - 2.0 * float((w * gxy).sum()) + float((w * (gxx @ w)).sum())
+        ss_res = float(ss_res_c.sum())
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        self.last_column_residuals = (ss_res_c.cpu(), syy.double().cpu())
         w = w.to(self.dtype)
         b = my - mx @ w
         return w, b, r2
+
+    @staticmethod
+    def block_r2(ss_res_c: torch.Tensor, syy_c: torch.Tensor, block: int) -> list[float]:
+        """R^2 per contiguous column block of width ``block`` (one block per head), from per-column sums."""
+        out = []
+        for i in range(0, ss_res_c.numel(), block):
+            tot = float(syy_c[i:i + block].sum())
+            out.append(1.0 - float(ss_res_c[i:i + block].sum()) / tot if tot > 0 else float("nan"))
+        return out
 
     # ---- (de)serialisation ------------------------------------------------------------------
     def state_dict(self) -> dict:

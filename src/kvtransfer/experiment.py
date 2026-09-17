@@ -6,13 +6,19 @@ Stages (each resumable from files under ``out_dir``):
 2. **calibrate**  500 x 1,024 tokens, stride 4, K/V (and K_rope for the ablation) -> ``stats/``
 3. **fit**        ridge, lambda 0.01, k sweep {1,2,4,6,8,10,12,16,20,24,all} clipped to L_s -> ``mappers/k*/``
 4. **eval**       held-out R^2, attention-output cosine, logit KL, top-1 agreement per k -> ``eval_k*.json``;
-                  best k = highest mean attention-output cosine (the paper's recommended predictor, Sec. 4.5;
-                  the paper itself selects k on benchmark accuracy, which ``kvtransfer harness`` gives you)
-5. **ablation**   at the best k: "-all RoPE" (fit and apply on rotated keys) and "-inference RoPE"
-                  (content-space fit, no re-rotation), the rows of Table 2 -> ``ablation.json``
-6. **bench**      mapper vs. target re-prefill across sequence lengths (Sec. 4.7), with energy -> ``bench.json``
-7. **multiturn**  drift over alternating handoffs on a long document (Sec. 4.6 analogue) -> ``multiturn.json``
-8. **report**     ``report.json`` + ``report.md``
+                  best k = highest mean attention-output cosine.  This is *our* criterion: the paper selects k
+                  by log-likelihood benchmark accuracy (Sec. 4.1, App. H) and presents cosine as the
+                  cross-pair predictor of retention (Sec. 4.5); ``kvtransfer harness`` gives the paper's criterion.
+5. **ablation**   at the best k, the rows of Table 2: full; "-inference RoPE" (content fit, no re-rotation);
+                  "-all RoPE" (fit and apply on rotated keys); "-RoPE -cross-layer" (rotated keys, k=1);
+                  "-RoPE -cross-layer -ridge" (rotated keys, k=1, lambda=0) -> ``ablation.json``
+6. **reverse**    calibrate target->source and fit the reverse mapper at the best k, so large-to-small
+                  transfer is evaluated (Sec. 4.2/4.5) and multi-turn can alternate -> ``reverse/``
+7. **bench**      mapper vs. target re-prefill across ten sequence lengths 64..32768, 50 warmup + 30 timed
+                  trials (App. G), with energy -> ``bench.json``
+8. **multiturn**  drift over alternating handoffs on a long document (Sec. 4.6 analogue: KL / top-1 vs the
+                  target's standalone distribution instead of CoQA F1) -> ``multiturn.json``
+9. **report**     ``report.json`` + ``report.md``
 """
 from __future__ import annotations
 
@@ -53,12 +59,13 @@ class ExperimentConfig:
     eval_n_seqs: int = 32
     eval_seq_len: int = 1024
     eval_suffix_len: int = 32
-    bench_seq_lens: tuple = (64, 256, 1024, 4096, 8192, 32768)
-    bench_warmup: int = 5
-    bench_trials: int = 10
+    bench_seq_lens: tuple = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)   # App. G: ten lengths
+    bench_warmup: int = 50                                                             # App. G
+    bench_trials: int = 30                                                             # App. G
     multiturn_turns: int = 10
     multiturn_turn_tokens: int = 64
     ablation: bool = True
+    reverse: bool = True                 # also calibrate/fit target->source (L->S eval + alternating multi-turn)
     device: str | None = None
     dtype: str | None = None
     attn: str | None = None
@@ -67,7 +74,7 @@ class ExperimentConfig:
     force: bool = False                  # run even if the plan says it does not fit
     allow_mismatched: bool = False       # mismatched-KV pair (research extension beyond the paper)
     trust_remote_code: bool = False
-    stages: tuple = ("plan", "calibrate", "fit", "eval", "ablation", "bench", "multiturn", "report")
+    stages: tuple = ("plan", "calibrate", "fit", "eval", "ablation", "reverse", "bench", "multiturn", "report")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -292,22 +299,55 @@ def run_experiment(cfg: ExperimentConfig, log=print) -> dict:
             abl = json.loads(p.read_text())
         else:
             score = {k: np.asarray(v) for k, v in json.loads((out / "selection_r2.json").read_text()).items()}
+            # Table 2 rows, removed sequentially as in the paper
             variants = {
                 "full (content-space)": mappers[best_k],
-                "-all RoPE (fit+apply on rotated keys)": Mapper.fit(stats, k=best_k, lam=cfg.lam, score=score["mean"], key_space="rope"),
                 "-inference RoPE (content fit, no re-rotation)": mappers[best_k].ablate_inference_rope(),
-                "-cross-layer (k=1)": mappers.get(1) or Mapper.fit(stats, k=1, lam=cfg.lam, score=score["mean"]),
+                "-all RoPE (fit+apply on rotated keys)": Mapper.fit(stats, k=best_k, lam=cfg.lam, score=score["mean"], key_space="rope"),
+                "-RoPE -cross-layer (rotated keys, k=1)": Mapper.fit(stats, k=1, lam=cfg.lam, score=score["mean"], key_space="rope"),
+                "-RoPE -cross-layer -ridge (rotated keys, k=1, lambda=0)": Mapper.fit(stats, k=1, lam=0.0, score=score["mean"], key_space="rope"),
             }
             abl = {}
             for name, m in variants.items():
                 r = evaluate(s, t, m, held, prefix_len=cfg.eval_seq_len - cfg.eval_suffix_len, suffix_len=cfg.eval_suffix_len)
                 abl[name] = {"attn_cosine_mean": r.attn_cosine_mean, "kl_mean": r.kl_mean, "top1_agreement": r.top1_agreement,
-                             "r2_K": float(np.mean(r.r2_K)), "r2_V": float(np.mean(r.r2_V))}
+                             "r2_K": float(np.nanmean(r.r2_K)), "r2_V": float(np.nanmean(r.r2_V))}
                 log(f"[ablation] {name}: cosine {r.attn_cosine_mean:.3f} KL {r.kl_mean:.3f} top-1 {r.top1_agreement:.3f}")
             _json(p, abl)
         report["stages"]["ablation"] = abl
 
-    # ---- 6. bench -----------------------------------------------------------------------------
+    # ---- 6. reverse direction ------------------------------------------------------------------
+    reverse_mapper = None
+    if "reverse" in cfg.stages and cfg.reverse and best_k is not None:
+        s, t, _ = models()
+        rdir = out / "reverse"
+        rstats_dir = rdir / "stats"
+        if (rdir / "mapper" / "mapper.json").exists():
+            reverse_mapper = Mapper.load(rdir / "mapper")
+            rev = json.loads((rdir / "eval.json").read_text()) if (rdir / "eval.json").exists() else {}
+        else:
+            if (rstats_dir / "meta.json").exists():
+                rstats = CalibrationStats.load(rstats_dir, device=cfg.stats_device)
+            else:
+                t0 = time.time()
+                rstats = calibrate(t, s, batches(sequences(cfg.n_seqs, cfg.seq_len), cfg.batch_size), stride=cfg.stride,
+                                   kinds=("K", "V"), stats_device=cfg.stats_device, source_name=cfg.target, target_name=cfg.source,
+                                   require_matched_kv=not cfg.allow_mismatched, progress=True)
+                rstats.save(rstats_dir)
+                log(f"[reverse] calibrated target->source in {time.time() - t0:.0f}s")
+            k_rev = min(best_k, rstats.source.n_layers)
+            reverse_mapper = Mapper.fit(rstats, k=k_rev, lam=cfg.lam)
+            reverse_mapper.save(rdir / "mapper")
+            held = sequences(cfg.eval_n_seqs, cfg.eval_seq_len, skip=cfg.n_seqs)
+            r = evaluate(t, s, reverse_mapper, held, prefix_len=cfg.eval_seq_len - cfg.eval_suffix_len, suffix_len=cfg.eval_suffix_len)
+            rev = r.to_dict() | {"k": k_rev, "direction": f"{cfg.target} -> {cfg.source}"}
+            _json(rdir / "eval.json", rev)
+            log(f"[reverse] L->S k={k_rev}: cosine {r.attn_cosine_mean:.3f} KL {r.kl_mean:.3f} top-1 {r.top1_agreement:.3f}")
+            del rstats
+        report["stages"]["reverse"] = {k: rev.get(k) for k in ("k", "direction", "attn_cosine_mean", "attn_cosine_min",
+                                                                 "kl_mean", "kl_p95", "top1_agreement")} if rev else {}
+
+    # ---- 7. bench -----------------------------------------------------------------------------
     if "bench" in cfg.stages and best_k is not None:
         s, t, _ = models()
         p = out / "bench.json"
@@ -326,7 +366,7 @@ def run_experiment(cfg: ExperimentConfig, log=print) -> dict:
             _json(p, rows)
         report["stages"]["bench"] = rows
 
-    # ---- 7. multiturn -------------------------------------------------------------------------
+    # ---- 8. multiturn -------------------------------------------------------------------------
     if "multiturn" in cfg.stages and best_k is not None:
         s, t, _ = models()
         p = out / "multiturn.json"
@@ -335,12 +375,13 @@ def run_experiment(cfg: ExperimentConfig, log=print) -> dict:
         else:
             need = cfg.multiturn_turns * cfg.multiturn_turn_tokens
             doc = sequences(1, need, skip=cfg.n_seqs + cfg.eval_n_seqs)[0][None]
-            mt = multiturn_drift(s, t, mappers[best_k], doc, cfg.multiturn_turns, cfg.multiturn_turn_tokens)
+            mt = multiturn_drift(s, t, mappers[best_k], doc, cfg.multiturn_turns, cfg.multiturn_turn_tokens,
+                                 mapper_ts=reverse_mapper)
             _json(p, mt)
             log(f"[multiturn] KL slope {mt['kl_slope_per_turn']} per turn")
         report["stages"]["multiturn"] = mt
 
-    # ---- 8. report ----------------------------------------------------------------------------
+    # ---- 9. report ----------------------------------------------------------------------------
     report["seconds_total"] = time.time() - t_all
     _json(out / "report.json", report)
     (out / "report.md").write_text(format_report(report, cfg))
@@ -367,12 +408,18 @@ def format_report(rep: dict, cfg: ExperimentConfig) -> str:
         for r in st["eval"]["per_k"]:
             L.append(f"| {r['k']} | {r['attn_cosine_mean']:.3f} | {r['attn_cosine_min']:.3f} | {r['kl_mean']:.3f} | {r['kl_p95']:.3f} | "
                      f"{r['top1_agreement']:.3f} | {r['r2_K']:.3f} | {r['r2_V']:.3f} |")
-        L.append(f"\nBest k by {st['eval']['criterion']}: {st['eval']['best_k']}. "
-                 f"Source-vs-target next-token agreement (no transfer): {st['eval']['per_k'][0]['source_top1_agreement']:.3f}.")
+        L.append(f"\nBest k by {st['eval']['criterion']} (our criterion; the paper selects k by benchmark accuracy): "
+                 f"{st['eval']['best_k']}. Source-vs-target next-token agreement (no transfer): "
+                 f"{st['eval']['per_k'][0]['source_top1_agreement']:.3f}.")
     if "ablation" in st:
         L += ["", "## Ablation at best k (paper Table 2 analogue)", "| variant | attn cosine | KL mean | top-1 | R2 K | R2 V |", "|---|---:|---:|---:|---:|---:|"]
         for name, r in st["ablation"].items():
             L.append(f"| {name} | {r['attn_cosine_mean']:.3f} | {r['kl_mean']:.3f} | {r['top1_agreement']:.3f} | {r['r2_K']:.3f} | {r['r2_V']:.3f} |")
+    if st.get("reverse"):
+        r = st["reverse"]
+        L += ["", "## Large-to-small direction (paper Sec. 4.2 / 4.5, HellaSwag-only there)",
+              f"{r['direction']} at k={r['k']}: attn cosine {r['attn_cosine_mean']:.3f} (min layer {r['attn_cosine_min']:.3f}), "
+              f"KL mean {r['kl_mean']:.3f} (p95 {r['kl_p95']:.3f}), top-1 {r['top1_agreement']:.3f}"]
     if "bench" in st:
         L += ["", "## Latency: mapper vs. target re-prefill (paper Sec. 4.7)", "| seq len | mapper ms | re-prefill ms | speedup | energy method |", "|---:|---:|---:|---:|---|"]
         for r in st["bench"]:
@@ -380,7 +427,8 @@ def format_report(rep: dict, cfg: ExperimentConfig) -> str:
             L.append(f"| {r['seq_len']} | {r['mapper_ms']:.1f} | {r['reprefill_ms']:.1f} | {r['speedup']:.1f}x | {e} |")
     if "multiturn" in st:
         mt = st["multiturn"]
-        L += ["", "## Multi-turn drift (paper Sec. 4.6 analogue)", f"KL slope per turn: {mt.get('kl_slope_per_turn')}", "",
+        mode = "alternating source/target every turn" if mt.get("alternating") else "one handoff source->target, then target only"
+        L += ["", "## Multi-turn drift (paper Sec. 4.6 analogue)", f"Mode: {mode}. KL slope per turn: {mt.get('kl_slope_per_turn')}", "",
               "| turn | live | KL vs target standalone | top-1 |", "|---:|---|---:|---:|"]
         for r in mt["turns"]:
             kl = "" if r["kl"] is None else f"{r['kl']:.3f}"

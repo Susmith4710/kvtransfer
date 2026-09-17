@@ -28,9 +28,12 @@ def test_appendix_d_parameter_counts(s, Ls, t, Lt, k, expected):
     assert abs(n - expected) / expected < 0.01, (n, expected)
 
 
-def test_paper_storage_sizes_match_table_12():
-    # 1.07 B params -> "4 GB"; 3.36 B -> "12 GB" (fp32)
-    assert round(1.07e9 * 4 / 1e9) == 4 and round(3.36e9 * 4 / 1e9) == 13 or round(3.36e9 * 4 / hw.GIB) == 12
+@pytest.mark.parametrize("s, Ls, t, Lt, k, gb", [("Qwen3-14B", 40, "Qwen3-32B", 64, 8, 4), ("Qwen3-8B", 36, "Qwen3-32B", 64, 12, 6),
+                                                   ("Ministral-3-3B", 26, "Ministral-3-8B", 34, 26, 7), ("Llama-3.1-8B", 32, "Llama-3.1-70B", 80, 20, 12)])
+def test_paper_storage_sizes_match_table_12(s, Ls, t, Lt, k, gb):
+    """Table 12 'Storage' column (fp32 GB) from the formula."""
+    n = Mapper.formula_params(spec(t, Lt), spec(s, Ls), k)
+    assert round(n * 4 / hw.GIB) == gb
 
 
 def test_detect_runs_on_cpu_box():

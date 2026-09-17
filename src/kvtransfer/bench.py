@@ -2,7 +2,9 @@
 
 Re-prefill runs the target's transformer body (``model.model``) without the LM head, as in the
 paper.  The mapper runs in eager mode.  Inputs are synthetic; the source prefill is *not* part of
-either number, because in the deployment scenario it has already happened.
+either number, because in the deployment scenario it has already happened.  The paper's protocol is
+50 warmup + 30 timed trials over ten lengths 64..32768 (App. G); ``benchmark``'s own defaults are
+smaller for quick checks, and ``kvtransfer experiment`` uses the paper's constants.
 """
 from __future__ import annotations
 

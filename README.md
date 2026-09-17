@@ -138,8 +138,9 @@ sess.feed(ids); sess.generate(32); sess.switch_to("large"); sess.feed(more_ids);
 | Sec. 4.7 mapper vs. re-prefill latency | `bench.benchmark` |
 | Sec. 4.3 / Table 2 ablations (-all RoPE, -inference RoPE, k=1) | `Mapper.fit(key_space="rope")`, `Mapper.ablate_inference_rope()`, `experiment` stage `ablation` |
 | Sec. 4.1 benchmarks and retention / floor-normalized retention | `lm_eval_adapter.TransferLM` (`--model kvtransfer` in lm-eval), `retention_table`, `kvtransfer harness` |
+| Sec. 4.2 / 4.5 large-to-small direction | `experiment` stage `reverse` (calibrates target->source, evaluates, enables alternating multi-turn) |
 | Sec. 4.4 MLP mapper for the pairs where ridge fails | not implemented |
-| App. B greedy forward selection, App. C lambda/N/domain sweeps | not implemented (fixed top-k by single-source R2 is the paper's production choice) |
+| Sec. 4.5 K/V error-concentration diagnostics, App. B greedy forward selection, App. C lambda/N/domain sweeps, App. D prefix-conditioned WikiText perplexity, App. H leave-one-out re-selection | not implemented (see docs/PAPER_VERIFICATION.md) |
 
 One implementation choice the paper leaves implicit: to get the target's first logit you need one
 target forward pass, so the last `hold_back` prompt tokens (default 1) are not mapped but run through

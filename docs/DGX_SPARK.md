@@ -79,9 +79,11 @@ kvtransfer experiment --source Qwen/Qwen3-4B-Instruct-2507 --target Qwen/Qwen3-8
 
 Runs the whole protocol: plan → 500×1024-token calibration (stride 4) → k sweep
 {1,2,4,6,8,10,12,16,20,24,all} → held-out diagnostics per k → Table 2 ablations at the best k →
-latency sweep 64…32768 tokens with energy → multi-turn drift → `report.md`. Every stage resumes
-from disk, so a crash costs only the stage in flight. Expect roughly an hour on the Spark; the
-plan prints an estimate.
+reverse calibration (large→small, so the L→S direction is evaluated and multi-turn alternates)
+→ latency sweep over ten lengths 64…32768 with 50 warmup + 30 timed trials and energy →
+multi-turn drift → `report.md`. Every stage resumes from disk, so a crash costs only the stage in
+flight. Expect one to two hours on the Spark (two calibrations); `--no-reverse` halves that, and
+the plan prints an estimate.
 
 Then downstream accuracy, the paper's actual metric:
 

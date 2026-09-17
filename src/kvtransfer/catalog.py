@@ -129,7 +129,7 @@ def classify_pair(a: CatalogEntry, b: CatalogEntry) -> tuple[str, str]:
         return "unusable", f"different tokenizers ({a.family} vs {b.family}); token positions cannot align"
     matched = (a.n_kv, a.head_dim) == (b.n_kv, b.head_dim)
     same_series = _series(a) == _series(b)
-    note = PAPER_PAIRS.get((_canon(a), _canon(b))) or PAPER_PAIRS.get((_canon(b), _canon(a)))
+    note = PAPER_PAIRS.get((_canon(a), _canon(b)))
     if note:
         return "paper-validated", note
     if matched and same_series:

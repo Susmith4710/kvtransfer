@@ -190,10 +190,95 @@ def test_experiment_end_to_end_on_tiny_models(tmp_path):
     assert sorted(p.name for p in (out / "mappers").iterdir()) == ["k1", "k2", "k3"]
     assert rep["best_k"] in (1, 2, 3)
     assert set(rep["stages"]) >= {"plan", "calibrate", "fit", "eval", "ablation", "bench", "multiturn"}
-    assert len(rep["stages"]["ablation"]) == 4
-    assert rep["stages"]["multiturn"]["turns"][1]["live"] == "t"
+    assert len(rep["stages"]["ablation"]) == 5
+    assert rep["stages"]["multiturn"]["alternating"] is True
+    assert [r["live"] for r in rep["stages"]["multiturn"]["turns"]] == ["s", "t", "s", "t"]
+    assert (out / "reverse" / "mapper" / "mapper.json").exists() and rep["stages"]["reverse"]["k"] >= 1
     # resume: second run must reuse everything and not recalibrate
     rep2 = run_experiment(cfg, log=lambda *a: None)
     assert "calibrate" not in rep2["stages"]  # reused stats, no new calibration timing
     md = (out / "report.md").read_text()
     assert "Ablation" in md and "Latency" in md and "Multi-turn" in md
+
+
+def test_generate_cache_covers_all_tokens_even_with_eos(src_model, tgt_model, pair_mapper):
+    """Review finding: an EOS stop must not leave the cache one token short of the token sequence."""
+    xfer = CrossModelTransfer(src_model, tgt_model, pair_mapper)
+    ids = torch.randint(0, 257, (1, 9))
+    # find the greedy first token and use it as EOS so generation stops immediately
+    logits, _ = xfer.handoff(ids, hold_back=1)
+    eos = int(logits[:, -1].argmax(-1))
+    res = xfer.generate(ids, max_new_tokens=5, hold_back=1, eos_token_id=eos)
+    assert res.tokens.shape[1] == 10 and int(res.tokens[0, -1]) == eos
+    assert res.target_cache.get_seq_length() == res.tokens.shape[1]
+    # Session: same invariant, and feeding after EOS keeps positions aligned
+    from kvtransfer import Session
+    sess = Session({"s": src_model, "t": tgt_model}, {("s", "t"): pair_mapper}, start="t")
+    sess.feed(ids)
+    eos2 = int(sess.last_logits.argmax(-1))
+    sess.generate(5, eos_token_id=eos2)
+    assert sess.cache.get_seq_length() == sess.tokens.shape[1]
+    sess.feed(torch.randint(0, 257, (1, 3)))
+    assert sess.cache.get_seq_length() == sess.tokens.shape[1]
+
+
+def test_escalator_cache_alignment_with_eos(src_model, tgt_model, pair_mapper):
+    from kvtransfer.serve import Escalator
+
+    class Tok:
+        eos_token_id = 7
+
+        def __call__(self, text, return_tensors=None):
+            return {"input_ids": torch.tensor([[ord(c) % 250 for c in text]])}
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "x" * len(ids)
+
+    esc = Escalator(src_model, tgt_model, pair_mapper, Tok(), chat_default=False)
+    esc.generate({"session": "e", "role": "source", "prompt": "hello there world", "max_new_tokens": 6})
+    st = esc.sessions["e"]
+    assert st.source_cache.get_seq_length() == st.source_tokens.shape[1]
+    r = esc.generate({"session": "e", "role": "escalate", "prompt": "hello there world again", "max_new_tokens": 2})
+    assert r["timing"]["skipped_tokens"] <= st.source_cache.get_seq_length()
+
+
+def test_paper_notes_are_direction_specific():
+    from kvtransfer.catalog import BY_ID, classify_pair
+    small, large = BY_ID["meta-llama/Llama-3.1-8B-Instruct"], BY_ID["meta-llama/Llama-3.1-70B-Instruct"]
+    # 70B is flagged unsupported on a 128 GB box, so test the note lookup directly
+    from kvtransfer.discover import PAPER_PAIRS
+    assert "Tier 1" in PAPER_PAIRS[("Llama-3.1-8B", "Llama-3.1-70B")]
+    assert "37 %" in PAPER_PAIRS[("Llama-3.1-70B", "Llama-3.1-8B")]
+    q14, q32 = BY_ID["Qwen/Qwen3-14B"], BY_ID["Qwen/Qwen3-32B"]
+    assert classify_pair(q14, q32)[0] == "paper-validated" and "97.6" in classify_pair(q14, q32)[1]
+    assert classify_pair(q32, q14)[0] == "paper-validated" and "L->S" in classify_pair(q32, q14)[1]
+
+
+def test_selection_score_raises_on_missing_kind(src_model):
+    stats = calibrate(src_model, src_model, random_batches(2, 2, 16, seed=1), stride=1, kinds=("V",))
+    with pytest.raises(ValueError, match="lack kind"):
+        selection_score(stats)
+
+
+def test_discover_tolerates_file_roots(tmp_path):
+    from kvtransfer.discover import scan
+    f = tmp_path / "not_a_dir.txt"
+    f.write_text("x")
+    assert scan([f], include_hf_cache=False) == []
+
+
+def test_retention_summary():
+    from kvtransfer.lm_eval_adapter import retention_summary
+    rows = [{"retention_pct": 90.0, "normalized_retention_pct": 80.0}, {"retention_pct": 100.0, "normalized_retention_pct": None}]
+    s = retention_summary(rows)
+    assert s["n_tasks"] == 2 and s["avg_retention_pct"] == 95.0 and s["avg_floor_normalized_pct"] == 80.0
+
+
+def test_fit_r2_is_head_averaged(src_model):
+    """Head-averaged R^2 must equal the mean of per-head solves (paper Table 7 / App. B)."""
+    stats = calibrate(src_model, src_model, random_batches(4, 4, 32, seed=2), stride=1)
+    m = Mapper.fit(stats, k=1, lam=0.01)
+    lt = 1
+    rows = stats.src_rows(m.selected[lt].tolist())
+    per_head = [stats.acc["K"].solve(0.01, rows=rows, cols=stats.tgt_cols(lt, h))[2] for h in range(stats.target.n_kv)]
+    assert abs(m.fit_r2["K"][lt] - float(np.mean(per_head))) < 1e-6

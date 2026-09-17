@@ -39,7 +39,10 @@ def probe_r2(stats: CalibrationStats, kind: str, lam: float = 0.0) -> np.ndarray
 def selection_score(stats: CalibrationStats, lam: float = 0.0, kinds=("K", "V")) -> dict:
     """R^2 heatmaps for the given kinds plus their mean, the selection criterion of Sec. 3.2
     (head-averaged R^2 averaged over RoPE-stripped keys and values)."""
-    maps = {kind: probe_r2(stats, kind, lam) for kind in kinds if kind in stats.acc}
+    missing = [k for k in kinds if k not in stats.acc]
+    if missing:
+        raise ValueError(f"calibration stats lack kind(s) {missing}; selection needs {list(kinds)}")
+    maps = {kind: probe_r2(stats, kind, lam) for kind in kinds}
     maps["mean"] = np.mean(np.stack(list(maps.values())), axis=0)
     return maps
 

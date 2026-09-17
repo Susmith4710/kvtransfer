@@ -44,6 +44,16 @@ def common_prefix_len(a: torch.Tensor, b: torch.Tensor) -> int:
     return int(nz[0]) if nz.numel() else n
 
 
+
+def _sync(dev):
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+
+
+def _now(dev) -> float:
+    _sync(dev)
+    return time.perf_counter()
+
 @dataclass
 class SessionState:
     source_tokens: torch.Tensor | None = None     # [1, T] tokens the source has in cache
@@ -75,11 +85,13 @@ class Escalator:
         for _ in range(max_new):
             nxt = logits[:, -1].argmax(-1)
             new.append(int(nxt))
-            if self.eos is not None and int(nxt) == self.eos:
-                break
+            # run the token (EOS included) so the cache covers every token we keep for the session
             out = forward_with_cache(model, cache, nxt[:, None].to(dev), past_len=seq.shape[1] + len(new) - 1)
             logits, cache = out.logits, out.past_key_values
+            if self.eos is not None and int(nxt) == self.eos:
+                break
         return new, cache
+
 
     @torch.no_grad()
     def generate(self, req: dict) -> dict:
@@ -95,52 +107,56 @@ class Escalator:
             t0 = time.perf_counter()
             if role == "source":
                 model = self.xfer.source
-                ids_d = ids.to(self.xfer.src_dev)
+                dev = self.xfer.src_dev
+                ids_d = ids.to(dev)
                 logits, cache = prefill(model, ids_d)
-                timing["prefill_ms"] = (time.perf_counter() - t0) * 1000
+                timing["prefill_ms"] = (_now(dev) - t0) * 1000
                 timing["prefill_tokens"] = T
                 t1 = time.perf_counter()
                 new, cache = self._decode(model, cache, logits, ids_d, max_new)
-                timing["decode_ms"] = (time.perf_counter() - t1) * 1000
+                timing["decode_ms"] = (_now(dev) - t1) * 1000
                 st.source_tokens = torch.cat([ids_d, torch.tensor([new], device=ids_d.device)], dim=1)
                 st.source_cache = cache
             elif role == "target" or (role == "escalate" and (req.get("baseline") or st.source_cache is None)):
                 model = self.xfer.target
-                ids_d = ids.to(self.xfer.tgt_dev)
+                dev = self.xfer.tgt_dev
+                ids_d = ids.to(dev)
                 logits, cache = prefill(model, ids_d)
-                timing["prefill_ms"] = (time.perf_counter() - t0) * 1000
+                timing["prefill_ms"] = (_now(dev) - t0) * 1000
                 timing["prefill_tokens"] = T
                 timing["skipped_tokens"] = 0
                 t1 = time.perf_counter()
                 new, cache = self._decode(model, cache, logits, ids_d, max_new)
-                timing["decode_ms"] = (time.perf_counter() - t1) * 1000
+                timing["decode_ms"] = (_now(dev) - t1) * 1000
                 if role == "escalate":
                     timing["mode"] = "re-prefill baseline" if req.get("baseline") else "re-prefill (no source cache for session)"
             elif role == "escalate":
                 model = self.xfer.target
+                dev = self.xfer.tgt_dev
                 ids_s = ids.to(self.xfer.src_dev)
                 shared = common_prefix_len(st.source_tokens, ids_s)
-                n_map = max(0, min(shared, T - hold_back))
+                cached = int(st.source_cache.get_seq_length())
+                n_map = max(0, min(shared, cached, T - hold_back))
                 if n_map == 0:
-                    logits, cache = prefill(model, ids.to(self.xfer.tgt_dev))
+                    logits, cache = prefill(model, ids.to(dev))
                     timing["mode"] = "re-prefill (no common prefix)"
                     timing["skipped_tokens"] = 0
                 else:
-                    t_m = time.perf_counter()
+                    t_m = _now(self.xfer.src_dev)
                     tgt_cache = self.xfer.map_cache(st.source_cache, n_map)
-                    timing["mapper_ms"] = (time.perf_counter() - t_m) * 1000
-                    tail = ids[:, n_map:].to(self.xfer.tgt_dev)
+                    timing["mapper_ms"] = (_now(dev) - t_m) * 1000
+                    tail = ids[:, n_map:].to(dev)
                     out = forward_with_cache(model, tgt_cache, tail, past_len=n_map)
                     logits, cache = out.logits, out.past_key_values
                     timing["mode"] = "transfer"
                     timing["skipped_tokens"] = n_map
                     timing["tail_tokens"] = int(tail.shape[1])
-                timing["prefill_ms"] = (time.perf_counter() - t0) * 1000
+                timing["prefill_ms"] = (_now(dev) - t0) * 1000
                 timing["prefill_tokens"] = T
                 t1 = time.perf_counter()
-                ids_d = ids.to(self.xfer.tgt_dev)
+                ids_d = ids.to(dev)
                 new, cache = self._decode(model, cache, logits, ids_d, max_new)
-                timing["decode_ms"] = (time.perf_counter() - t1) * 1000
+                timing["decode_ms"] = (_now(dev) - t1) * 1000
             else:
                 raise ValueError(f"unknown role {role!r}")
             timing["total_ms"] = (time.perf_counter() - t0) * 1000
