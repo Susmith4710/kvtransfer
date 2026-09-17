@@ -3,6 +3,11 @@
 # Usage: bash scripts/dgx_spark/run_tiers.sh [runs_dir]
 set -euo pipefail
 RUNS=${1:-runs}
+# Refuse to run outside a virtual environment: nothing here may touch the system Python or torch.
+if [ -z "${VIRTUAL_ENV:-}" ]; then
+  echo "error: activate the kvtransfer venv first (bash scripts/dgx_spark/setup_venv.sh; source ~/.venvs/kvtransfer/bin/activate)" >&2
+  exit 1
+fi
 export TRITON_PTXAS_PATH=${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}
 export TOKENIZERS_PARALLELISM=false
 

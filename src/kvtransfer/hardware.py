@@ -133,6 +133,10 @@ def detect() -> HardwareProfile:
         prof.notes.append(f"torch {torch.__version__} on aarch64 CUDA: make sure it is a cu130 build.")
     if os.environ.get("TRITON_PTXAS_PATH") is None and prof.compute_capability.startswith("12."):
         prof.notes.append("TRITON_PTXAS_PATH is not set; torch.compile/Triton kernels may fail on sm_12x.")
+    import sys
+    if sys.prefix == sys.base_prefix and os.environ.get("VIRTUAL_ENV") is None and os.environ.get("CONDA_PREFIX") is None:
+        prof.notes.append("Not running inside a virtual environment. Install kvtransfer and torch in a venv "
+                          "(scripts/dgx_spark/setup_venv.sh) so the system torch/CUDA stack is never modified.")
     return prof
 
 

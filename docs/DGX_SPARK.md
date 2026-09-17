@@ -13,22 +13,27 @@ things compared with the paper's 8×H100 node:
 
 ## 1. Environment
 
+Everything lives in a virtual environment. Nothing below touches the system Python, the system
+torch, the CUDA toolkit or the driver; the venv gets its own torch (cu130 wheel) and its own copies
+of every library. `run_tiers.sh` refuses to start outside a venv, and `kvtransfer doctor` warns.
+
 ```bash
-# DGX OS ships CUDA 13 only: install the cu130 PyTorch wheels (>= 2.9). cu12x wheels fail at import.
-python3 -m venv ~/kvt && source ~/kvt/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cu130
-pip install -e "kvtransfer[data,eval]"       # transformers, safetensors, datasets, lm-eval
-pip install pynvml                             # optional: energy in joules like the pod's tracker
-export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas   # only matters if something uses torch.compile
+git clone https://github.com/Susmith4710/kvtransfer && cd kvtransfer
+bash scripts/dgx_spark/setup_venv.sh            # creates ~/.venvs/kvtransfer, installs torch cu130 + kvtransfer[data,eval,nvml]
+source ~/.venvs/kvtransfer/bin/activate
+export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas   # env var only; only matters if something uses torch.compile
 
 kvtransfer doctor
 ```
 
+To remove it later: `rm -rf ~/.venvs/kvtransfer`. The venv's torch is a separate ~3 GB download
+and does not replace or upgrade the one already on the box.
+
 `doctor` prints the device, the memory pool, whether bf16 works, and which attention backend to use.
 On the Spark that is `sdpa` (flash-attn has no sm_121 wheels; the library defaults to SDPA).
 
-Alternative: NVIDIA's container, `nvcr.io/nvidia/pytorch:25.11-py3` or newer, then
-`pip install -e kvtransfer[data,eval]` inside it.
+Alternative with the same isolation: NVIDIA's container, `nvcr.io/nvidia/pytorch:25.11-py3` or
+newer, then `pip install -e kvtransfer[data,eval]` inside the container.
 
 Before a big run: `sync; echo 3 | sudo tee /proc/sys/vm/drop_caches`. Consider a cgroup cap
 (`systemd-run --scope -p MemoryMax=100G ...`) and disabling swap so an over-allocation fails
@@ -38,8 +43,12 @@ instead of freezing the box.
 
 * Same tokenizer, **matched KV** (same number of KV heads and same head dimension), dense
   full attention. Depth and width may differ.
-* **PyTorch checkpoints**, not GGUF. Ollama cannot export or import a KV cache. Download the
-  Hugging Face version of each model you want to test (`huggingface-cli download Qwen/Qwen3-8B`).
+* **PyTorch checkpoints**, not GGUF. Ollama cannot export or import a KV cache, so the models
+  already pulled through Ollama (`~/.ollama/models`) cannot be used directly even though they are
+  the same weights. Download the Hugging Face version of each model you want to test into a
+  directory of your choice (`huggingface-cli download Qwen/Qwen2.5-7B-Instruct --local-dir
+  /data/hf/Qwen2.5-7B-Instruct`); `kvtransfer discover` shows the Ollama tag → HF id mapping.
+  Sizes in bf16: Qwen2.5-7B 15 GB, Qwen2.5-14B 30 GB, Qwen3-4B 8 GB, Qwen3-8B 16 GB.
 
 ## 3. Analyse your fleet before downloading anything
 
