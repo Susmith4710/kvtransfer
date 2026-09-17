@@ -22,10 +22,16 @@ from .metrics import EvalReport, evaluate
 from .rope import RopeCodec
 from .select import probe_r2, selection_score, top_k_layers
 from .transfer import CrossModelTransfer, Session, TransferResult
+from .hf import load_pair, encode_prompt, tokenizer_compatibility
+from .hardware import HardwareProfile, PairPlan, DGX_SPARK, detect as detect_hardware
+from .experiment import ExperimentConfig, run_experiment
+from .energy import EnergyMeter
 
 __version__ = "0.1.0"
 __all__ = [
     "CalibrationStats", "calibrate", "Mapper", "CrossModelTransfer", "Session", "TransferResult",
     "ModelSpec", "model_spec", "check_matched_kv", "load_model", "load_tokenizer", "RopeCodec",
     "probe_r2", "selection_score", "top_k_layers", "evaluate", "EvalReport", "benchmark", "format_rows",
+    "load_pair", "encode_prompt", "tokenizer_compatibility", "HardwareProfile", "PairPlan", "DGX_SPARK",
+    "detect_hardware", "ExperimentConfig", "run_experiment", "EnergyMeter",
 ]

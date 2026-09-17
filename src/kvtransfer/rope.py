@@ -43,8 +43,7 @@ class RopeCodec:
 
     @classmethod
     def from_model(cls, model: torch.nn.Module) -> "RopeCodec":
-        base = getattr(model, "model", model)
-        rot = getattr(base, "rotary_emb", None)
+        rot = find_rotary(model)
         if rot is None:
             raise ValueError(
                 "model exposes no `.model.rotary_emb`; only Llama/Qwen/Mistral-style HF models with a "
@@ -74,3 +73,20 @@ class RopeCodec:
         m2 = self.attention_scaling ** 2
         out = strip_rope(k_rope, cos, sin)
         return out / m2 if m2 != 1.0 else out
+
+
+def find_rotary(model: torch.nn.Module):
+    """Locate the model-level rotary embedding, including under multimodal wrappers
+    (``model.model.language_model.rotary_emb`` for Ministral 3 / Mistral3, Gemma 3, Qwen2.5-VL)."""
+    for path in (("model", "rotary_emb"), ("model", "language_model", "rotary_emb"),
+                 ("language_model", "model", "rotary_emb"), ("language_model", "rotary_emb"), ("rotary_emb",)):
+        obj = model
+        ok = True
+        for name in path:
+            obj = getattr(obj, name, None)
+            if obj is None:
+                ok = False
+                break
+        if ok and hasattr(obj, "inv_freq"):
+            return obj
+    return None

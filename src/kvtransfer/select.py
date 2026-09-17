@@ -14,23 +14,32 @@ from .calibration import CalibrationStats
 
 @torch.no_grad()
 def probe_r2(stats: CalibrationStats, kind: str, lam: float = 0.0) -> np.ndarray:
-    """Head-averaged single-source R^2 heatmap, shape [L_s, L_t] (rows = source layers)."""
+    """Head-averaged single-source R^2 heatmap, shape [L_s, L_t] (rows = source layers).
+
+    Matched-KV pairs use the paper's head-matched probe (source head h -> target head h, Eq. 2).
+    For mismatched KV (different head count or head dim, untested by the paper) each target head is
+    regressed on *all* source heads of the layer, which is the only well-defined per-head probe.
+    """
     acc = stats.acc[kind]
     Ls, Lt, H = stats.source.n_layers, stats.target.n_layers, stats.target.n_kv
+    matched = (stats.source.n_kv, stats.source.head_dim) == (stats.target.n_kv, stats.target.head_dim)
     out = np.zeros((Ls, Lt), dtype=np.float64)
     for ls in range(Ls):
+        rows_all = stats.src_rows([ls])
         for lt in range(Lt):
             vals = []
             for h in range(H):
-                _, _, r2 = acc.solve(lam, rows=stats.src_rows_head(ls, h), cols=stats.tgt_cols(lt, h))
+                rows = stats.src_rows_head(ls, h) if matched else rows_all
+                _, _, r2 = acc.solve(lam, rows=rows, cols=stats.tgt_cols(lt, h))
                 vals.append(r2)
             out[ls, lt] = float(np.mean(vals))
     return out
 
 
-def selection_score(stats: CalibrationStats, lam: float = 0.0) -> dict:
-    """R^2 heatmaps for each available kind plus their mean, the selection criterion of Sec. 3.2."""
-    maps = {kind: probe_r2(stats, kind, lam) for kind in stats.acc}
+def selection_score(stats: CalibrationStats, lam: float = 0.0, kinds=("K", "V")) -> dict:
+    """R^2 heatmaps for the given kinds plus their mean, the selection criterion of Sec. 3.2
+    (head-averaged R^2 averaged over RoPE-stripped keys and values)."""
+    maps = {kind: probe_r2(stats, kind, lam) for kind in kinds if kind in stats.acc}
     maps["mean"] = np.mean(np.stack(list(maps.values())), axis=0)
     return maps
 

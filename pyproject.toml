@@ -18,7 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 data = ["datasets>=2.19"]
-dev = ["pytest>=7"]
+eval = ["lm_eval>=0.4.9", "accelerate>=1.0"]
+nvml = ["pynvml>=11"]
+dev = ["pytest>=7", "lm_eval>=0.4.9", "accelerate>=1.0"]
 
 [project.scripts]
 kvtransfer = "kvtransfer.cli:main"

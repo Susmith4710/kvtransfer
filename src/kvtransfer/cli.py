@@ -173,6 +173,107 @@ def cmd_inspect(args):
         print(f"  target {lt:3d} <- {row.tolist()}  R2 K={r2k:.3f} V={r2v:.3f}")
 
 
+def cmd_doctor(args):
+    from .hardware import detect, format_profile
+    print(format_profile(detect()))
+
+
+def cmd_plan(args):
+    from .experiment import ExperimentConfig, plan_from_configs
+    from .hardware import PRESETS, detect
+    prof = PRESETS[args.hardware] if args.hardware else detect()
+    cfg = ExperimentConfig(args.source, args.target, out_dir=".", n_seqs=args.n_seqs, seq_len=args.seq_len,
+                           stride=args.stride, batch_size=args.batch_size, dtype=args.dtype,
+                           trust_remote_code=args.trust_remote_code)
+    print(plan_from_configs(args.source, args.target, cfg, prof)["text"])
+
+
+def cmd_discover(args):
+    from .discover import enumerate_pairs, format_models, format_ollama, format_pairs, mismatched_kv_neighbours, scan, scan_ollama
+    models = scan(args.models_dir or (), include_hf_cache=not args.no_hf_cache)
+    print(format_models(models) if models else "no Hugging Face checkpoints found")
+    print()
+    pairs = enumerate_pairs(models)
+    print(format_pairs(pairs))
+    mm = mismatched_kv_neighbours(models)
+    if mm:
+        print("\nSame-family pairs with mismatched KV (research extension, --allow-mismatched):")
+        for a, b, why in mm:
+            print(f"  {a.name} <-> {b.name}: {why}")
+    ol = scan_ollama(args.ollama_dir or ())
+    if ol:
+        print()
+        print(format_ollama(ol))
+    if args.json:
+        Path(args.json).write_text(json.dumps({"models": [m.to_dict() for m in models], "pairs": [p.to_dict() for p in pairs],
+                                               "ollama": [o.__dict__ for o in ol]}, indent=2))
+
+
+def cmd_pairs(args):
+    from .catalog import analyze_tags, format_analysis
+    from .hardware import PRESETS, detect
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
+    if args.ollama_config:
+        import re
+        text = Path(args.ollama_config).read_text()
+        tags += re.findall(r'"([A-Za-z0-9_.:\-]+:[A-Za-z0-9_.\-]+)"', text)
+    hw = PRESETS[args.hardware] if args.hardware else detect()
+    a = analyze_tags(tags, hw, n_seqs=args.n_seqs, seq_len=args.seq_len, stride=args.stride, batch_size=args.batch_size)
+    print(format_analysis(a))
+    if args.json:
+        Path(args.json).write_text(json.dumps({"models": [m.__dict__ for m in a["models"]], "unknown": a["unknown"],
+                                               "pairs": [p.to_dict() for p in a["pairs"]], "suggestions": a["suggestions"]}, indent=2))
+
+
+def cmd_experiment(args):
+    from .experiment import ExperimentConfig, PAPER_K_SWEEP, run_experiment
+    ks = tuple(("all" if k == "all" else int(k)) for k in args.k.split(",")) if args.k else PAPER_K_SWEEP
+    cfg = ExperimentConfig(
+        source=args.source, target=args.target, out_dir=args.out, data=args.data, n_seqs=args.n_seqs, seq_len=args.seq_len,
+        stride=args.stride, batch_size=args.batch_size, k_values=ks, lam=args.lam, eval_n_seqs=args.eval_n_seqs,
+        eval_seq_len=args.eval_seq_len, eval_suffix_len=args.eval_suffix_len,
+        bench_seq_lens=tuple(int(x) for x in args.bench_seq_lens.split(",")), bench_warmup=args.bench_warmup,
+        bench_trials=args.bench_trials, multiturn_turns=args.turns, multiturn_turn_tokens=args.turn_tokens,
+        ablation=not args.no_ablation, device=args.device, dtype=args.dtype, attn=args.attn, hardware=args.hardware,
+        stats_device=args.stats_device, force=args.force, allow_mismatched=args.allow_mismatched,
+        trust_remote_code=args.trust_remote_code, stages=tuple(args.stages.split(",")),
+    )
+    run_experiment(cfg)
+
+
+def cmd_serve(args):
+    from .mapper import Mapper
+    from .serve import Escalator, serve
+    src, tgt, tok = _load_pair(args)
+    esc = Escalator(src, tgt, Mapper.load(args.mapper), tok, chat_default=not args.raw)
+    srv = serve(esc, args.host, args.port)
+    print(f"kvtransfer escalation server on http://{args.host}:{args.port}  (source={args.source}, target={args.target})")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_harness(args):
+    from .lm_eval_adapter import run_harness
+    res = run_harness(args.source, args.target, args.mapper, tasks=args.tasks.split(","), device=args.device or "cuda",
+                      dtype=args.dtype or "auto", limit=args.limit, hold_back=args.hold_back,
+                      num_fewshot=args.num_fewshot, batch_size=args.batch_size)
+    rows = res["retention"]
+    print(f"{'task':22} {'metric':22} {'source':>7} {'target':>7} {'transfer':>8} {'retention':>9} {'floor-norm':>10}")
+    def f(x, w=7):
+        return f"{'n/a':>{w}}" if x is None else f"{x:{w}.3f}"
+
+    def pct(x, w):
+        return f"{'':>{w}}" if x is None else f"{x:{w - 1}.1f}%"
+
+    for r in rows:
+        print(f"{r['task']:22} {r['metric']:22} {f(r['source'])} {f(r['target'])} {f(r['transfer'], 8)} "
+              f"{pct(r['retention_pct'], 9)} {pct(r['normalized_retention_pct'], 10)}")
+    if args.out:
+        Path(args.out).write_text(json.dumps({k: (v if k == "retention" else v.get("results")) for k, v in res.items()}, indent=2, default=str))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kvtransfer", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -227,6 +328,80 @@ def build_parser() -> argparse.ArgumentParser:
     i = sub.add_parser("inspect", help="print a saved mapper's selection and fit R2")
     i.add_argument("--mapper", required=True)
     i.set_defaults(fn=cmd_inspect)
+    d = sub.add_parser("doctor", help="probe this machine (GPU, unified memory, torch/cuda, attention backend)")
+    d.set_defaults(fn=cmd_doctor)
+
+    pl = sub.add_parser("plan", help="memory/time plan for a pair from configs only (no weights loaded)")
+    pl.add_argument("--source", required=True)
+    pl.add_argument("--target", required=True)
+    pl.add_argument("--hardware", default=None, help="preset, e.g. dgx-spark (default: detect this machine)")
+    pl.add_argument("--n-seqs", type=int, default=500)
+    pl.add_argument("--seq-len", type=int, default=1024)
+    pl.add_argument("--stride", type=int, default=4)
+    pl.add_argument("--batch-size", type=int, default=4)
+    pl.add_argument("--dtype", default=None)
+    pl.add_argument("--trust-remote-code", action="store_true")
+    pl.set_defaults(fn=cmd_plan)
+
+    dv = sub.add_parser("discover", help="scan local checkpoints (dirs, HF cache, Ollama) and list transfer pairs")
+    dv.add_argument("--models-dir", action="append", help="directory of checkpoints (repeatable)")
+    dv.add_argument("--ollama-dir", action="append", help="Ollama models directory (repeatable)")
+    dv.add_argument("--no-hf-cache", action="store_true")
+    dv.add_argument("--json", default=None)
+    dv.set_defaults(fn=cmd_discover)
+
+    pr = sub.add_parser("pairs", help="analyse a list of model tags/ids offline (catalog) for the DGX Spark")
+    pr.add_argument("--tags", default=None, help="comma list of Ollama tags or HF ids")
+    pr.add_argument("--ollama-config", default=None, help="a config.toml with an [ollama] section; tags are extracted")
+    pr.add_argument("--hardware", default="dgx-spark")
+    pr.add_argument("--n-seqs", type=int, default=500)
+    pr.add_argument("--seq-len", type=int, default=1024)
+    pr.add_argument("--stride", type=int, default=4)
+    pr.add_argument("--batch-size", type=int, default=4)
+    pr.add_argument("--json", default=None)
+    pr.set_defaults(fn=cmd_pairs)
+
+    ex = sub.add_parser("experiment", help="full paper protocol on one pair: plan, calibrate, k sweep, eval, ablation, bench, multi-turn, report")
+    _add_pair(ex)
+    _add_data(ex, 500, 1024)
+    ex.add_argument("--out", required=True)
+    ex.add_argument("--stride", type=int, default=4)
+    ex.add_argument("--k", default=None, help="comma list; default is the paper sweep 1,2,4,6,8,10,12,16,20,24,all")
+    ex.add_argument("--lam", type=float, default=0.01)
+    ex.add_argument("--eval-n-seqs", type=int, default=32)
+    ex.add_argument("--eval-seq-len", type=int, default=1024)
+    ex.add_argument("--eval-suffix-len", type=int, default=32)
+    ex.add_argument("--bench-seq-lens", default="64,256,1024,4096,8192,32768")
+    ex.add_argument("--bench-warmup", type=int, default=5)
+    ex.add_argument("--bench-trials", type=int, default=10)
+    ex.add_argument("--turns", type=int, default=10)
+    ex.add_argument("--turn-tokens", type=int, default=64)
+    ex.add_argument("--no-ablation", action="store_true")
+    ex.add_argument("--hardware", default=None, help="plan against a preset (dgx-spark) instead of detecting")
+    ex.add_argument("--stats-device", default=None)
+    ex.add_argument("--force", action="store_true", help="run even if the plan says it does not fit")
+    ex.add_argument("--allow-mismatched", action="store_true", help="mismatched-KV pair (research extension beyond the paper)")
+    ex.add_argument("--stages", default="plan,calibrate,fit,eval,ablation,bench,multiturn,report")
+    ex.set_defaults(fn=cmd_experiment)
+
+    sv = sub.add_parser("serve", help="escalation server: small model answers, large model continues from the mapped cache")
+    _add_pair(sv)
+    sv.add_argument("--mapper", required=True)
+    sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--port", type=int, default=8765)
+    sv.add_argument("--raw", action="store_true", help="do not apply the chat template by default")
+    sv.set_defaults(fn=cmd_serve)
+
+    hs = sub.add_parser("harness", help="lm-evaluation-harness: source, target and transfer accuracy + retention (paper's metric)")
+    _add_pair(hs)
+    hs.add_argument("--mapper", required=True)
+    hs.add_argument("--tasks", default="arc_challenge,hellaswag,winogrande,mmlu,gsm8k")
+    hs.add_argument("--limit", type=int, default=None)
+    hs.add_argument("--num-fewshot", type=int, default=None)
+    hs.add_argument("--hold-back", type=int, default=1)
+    hs.add_argument("--batch-size", type=int, default=1)
+    hs.add_argument("--out", default=None)
+    hs.set_defaults(fn=cmd_harness)
     return p
 
 

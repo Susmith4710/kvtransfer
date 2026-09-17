@@ -27,6 +27,7 @@ from .ridge import MomentAccumulator
 from .rope import RopeCodec
 
 KINDS = ("K", "V")
+ALL_KINDS = ("K", "V", "Krope")   # "Krope": keys as cached (RoPE kept), for the paper's "-all RoPE" ablation
 
 
 @dataclass
@@ -95,10 +96,12 @@ def extract_content_kv(model, codec: RopeCodec, cache, n_layers: int, positions:
     sel = torch.arange(offset, positions.numel(), stride, device=positions.device)
     for l in range(n_layers):
         k, v = cache_layer(cache, l)
-        t = k if kind == "K" else v
+        t = v if kind == "V" else k
         t = t[:, :, sel]  # [B, n_kv, n, d_h]
         if kind == "K":
             t = codec.strip(t.float(), positions[sel])
+        elif kind == "Krope":
+            t = t.float()
         B, n_kv, n, d = t.shape
         feats.append(t.permute(0, 2, 1, 3).reshape(B * n, n_kv * d).float())
     return torch.cat(feats, dim=1)
@@ -124,6 +127,12 @@ def calibrate(
     tgt_spec = model_spec(target_model, target_name)
     if require_matched_kv:
         check_matched_kv(src_spec, tgt_spec)
+    else:
+        try:
+            check_matched_kv(src_spec, tgt_spec)
+        except ValueError as e:
+            import warnings
+            warnings.warn(f"proceeding with a mismatched-KV pair (research extension, no paper evidence): {e}", stacklevel=2)
     src_codec = RopeCodec.from_model(source_model)
     tgt_codec = RopeCodec.from_model(target_model)
     src_dev = next(source_model.parameters()).device

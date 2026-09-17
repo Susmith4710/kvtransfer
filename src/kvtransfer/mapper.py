@@ -35,6 +35,8 @@ class Mapper:
     b_V: list = field(default_factory=list)
     fit_r2: dict = field(default_factory=dict)  # {"K": [L_t], "V": [L_t]} in-sample per target layer
     meta: dict = field(default_factory=dict)
+    key_space: str = "content"      # "content": strip source RoPE, map, re-apply target RoPE (paper Sec. 3.3)
+                                    # "rope":    map the rotated keys directly (paper Table 2 "-all RoPE" ablation)
 
     # ---- properties ---------------------------------------------------------------------------
     @property
@@ -63,23 +65,31 @@ class Mapper:
     # ---- fitting ------------------------------------------------------------------------------
     @classmethod
     def fit(cls, stats: CalibrationStats, k="all", lam: float = 0.01, score: np.ndarray | None = None,
-            selection_lam: float = 0.0, solve_dtype=torch.float64, progress: bool = False) -> "Mapper":
-        """Select top-k source layers per target layer and solve the per-layer ridge for K and V."""
+            selection_lam: float = 0.0, solve_dtype=torch.float64, progress: bool = False,
+            key_space: str = "content") -> "Mapper":
+        """Select top-k source layers per target layer and solve the per-layer ridge for K and V.
+
+        ``key_space="rope"`` fits on the RoPE-coupled keys (calibration must include the ``Krope`` kind);
+        selection always uses the content-space score as in the paper.
+        """
+        if key_space not in ("content", "rope"):  # "content-norerotate" only via ablate_inference_rope()
+            raise ValueError("key_space must be 'content' or 'rope'")
+        k_kind = "K" if key_space == "content" else "Krope"
         if score is None:
-            score = selection_score(stats, selection_lam)["mean"]
+            score = selection_score(stats, selection_lam, kinds=("K", "V"))["mean"]
         selected = top_k_layers(score, k)
-        m = cls(stats.source, stats.target, selected, lam,
+        m = cls(stats.source, stats.target, selected, lam, key_space=key_space,
                 meta={"stride": stats.stride, "seq_len": stats.seq_len, "n_seqs": stats.n_seqs,
                       "n_tokens": {kind: acc.n for kind, acc in stats.acc.items()}})
-        for kind in ("K", "V"):
+        for kind in (k_kind, "V"):
             if kind not in stats.acc:
-                raise ValueError(f"calibration stats lack kind {kind!r}; both K and V are needed to fit")
+                raise ValueError(f"calibration stats lack kind {kind!r}; needed for key_space={key_space!r}")
         r2s = {"K": [], "V": []}
         for lt in range(stats.target.n_layers):
             rows = stats.src_rows(selected[lt].tolist())
             cols = stats.tgt_cols(lt)
             for kind in ("K", "V"):
-                w, b, r2 = stats.acc[kind].solve(lam, rows=rows, cols=cols, solve_dtype=solve_dtype)
+                w, b, r2 = stats.acc[k_kind if kind == "K" else "V"].solve(lam, rows=rows, cols=cols, solve_dtype=solve_dtype)
                 (m.W_K if kind == "K" else m.W_V).append(w.float().cpu())
                 (m.b_K if kind == "K" else m.b_V).append(b.float().cpu())
                 r2s[kind].append(r2)
@@ -100,8 +110,11 @@ class Mapper:
         wdt = self.W_K[0].dtype
         out_dtype = out_dtype or src_kvs[0][0].dtype
         needed = sorted(set(int(x) for x in self.selected.flatten()))
-        k_content = {l: src_codec.strip(src_kvs[l][0].to(wdt), positions).permute(0, 2, 1, 3).reshape(B, T, n_kv * d)
-                     for l in needed}
+        if self.key_space in ("content", "content-norerotate"):
+            k_content = {l: src_codec.strip(src_kvs[l][0].to(wdt), positions).permute(0, 2, 1, 3).reshape(B, T, n_kv * d)
+                         for l in needed}
+        else:
+            k_content = {l: src_kvs[l][0].to(wdt).permute(0, 2, 1, 3).reshape(B, T, n_kv * d) for l in needed}
         v_src = {l: src_kvs[l][1].to(wdt).permute(0, 2, 1, 3).reshape(B, T, n_kv * d) for l in needed}
         tw, td = self.target.n_kv, self.target.head_dim
         out = []
@@ -110,7 +123,8 @@ class Mapper:
             xk = torch.cat([k_content[l] for l in layers], dim=-1)
             xv = torch.cat([v_src[l] for l in layers], dim=-1)
             k_hat = (xk @ self.W_K[lt].to(dev) + self.b_K[lt].to(dev)).reshape(B, T, tw, td).permute(0, 2, 1, 3)
-            k_hat = tgt_codec.apply(k_hat, positions)
+            if self.key_space == "content":
+                k_hat = tgt_codec.apply(k_hat, positions)
             v_hat = (xv @ self.W_V[lt].to(dev) + self.b_V[lt].to(dev)).reshape(B, T, tw, td).permute(0, 2, 1, 3)
             out.append((k_hat.to(out_dtype).contiguous(), v_hat.to(out_dtype).contiguous()))
         return out
@@ -149,6 +163,7 @@ class Mapper:
             "target": self.target.to_dict(),
             "k": self.k,
             "lam": self.lam,
+            "key_space": self.key_space,
             "selected": self.selected.tolist(),
             "fit_r2": self.fit_r2,
             "n_params": self.n_params(),
@@ -162,17 +177,25 @@ class Mapper:
         t = load_file(str(path / "mapper.safetensors"))
         Lt = len(meta["selected"])
         m = cls(ModelSpec(**meta["source"]), ModelSpec(**meta["target"]), np.asarray(meta["selected"]),
-                meta["lam"], fit_r2=meta.get("fit_r2", {}), meta=meta.get("meta", {}))
+                meta["lam"], fit_r2=meta.get("fit_r2", {}), meta=meta.get("meta", {}),
+                key_space=meta.get("key_space", "content"))
         m.W_K = [t[f"K.W.{l}"] for l in range(Lt)]
         m.b_K = [t[f"K.b.{l}"] for l in range(Lt)]
         m.W_V = [t[f"V.W.{l}"] for l in range(Lt)]
         m.b_V = [t[f"V.b.{l}"] for l in range(Lt)]
         return m.to(device=device, dtype=dtype)
 
+    def ablate_inference_rope(self) -> "Mapper":
+        """Paper Table 2 "-inference RoPE": the content-space fit applied *without* re-rotating the mapped
+        keys (a fit-vs-inference mismatch the paper shows collapses MMLU/GSM8K).  Shares weights."""
+        m = Mapper(self.source, self.target, self.selected, self.lam, self.W_K, self.b_K, self.W_V, self.b_V,
+                   self.fit_r2, dict(self.meta), key_space="content-norerotate")
+        return m
+
     def summary(self) -> str:
         r2k = np.mean(self.fit_r2.get("K", [float("nan")]))
         r2v = np.mean(self.fit_r2.get("V", [float("nan")]))
         n = self.n_params()
         size = f"{n / 1e9:.2f} B params ({n * 4 / 1e9:.1f} GB fp32)" if n >= 1e8 else f"{n / 1e6:.2f} M params ({n * 4 / 1e6:.1f} MB fp32)"
-        return (f"{self.source.name} -> {self.target.name}: k={self.k}, lambda={self.lam}, {size}, "
-                f"in-sample R2 K={r2k:.3f} V={r2v:.3f}")
+        return (f"{self.source.name} -> {self.target.name}: k={self.k}, lambda={self.lam}, key_space={self.key_space}, "
+                f"{size}, in-sample R2 K={r2k:.3f} V={r2v:.3f}")

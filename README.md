@@ -34,6 +34,32 @@ pip install -e "kvtransfer[data]"    # + datasets, for FineWeb-Edu streaming
 pytest kvtransfer                    # offline CPU suite, tiny random models, ~3 s
 ```
 
+## Testing on a DGX Spark against a specific fleet
+
+* `docs/DGX_SPARK.md`: environment, memory rules for unified memory, which pairs fit, the three
+  experiments to run in order, how to read the numbers.
+* `docs/VORTEXEDGE.md`: where transfer fits a memory-first pod's SYNTHESIZE -> ESCALATE flow, why
+  Ollama/GGUF cannot be used directly, prefix sharing, the escalation server, what integration would look like.
+* `docs/PAPER_VERIFICATION.md`: every paper claim mapped to the code and to the test that checks it.
+* `scripts/dgx_spark/run_tiers.sh`: the three tiers end to end.
+
+```bash
+kvtransfer doctor                                       # GPU, unified memory, torch/cuda, attention backend
+kvtransfer pairs --tags "qwen2.5:7b-instruct,qwen2.5:14b-instruct,qwen3:4b-instruct" --hardware dgx-spark
+kvtransfer discover --models-dir /data/models            # real configs + Ollama store -> pairs
+kvtransfer plan --source Qwen/Qwen3-4B-Instruct-2507 --target Qwen/Qwen3-8B --hardware dgx-spark
+kvtransfer experiment --source Qwen/Qwen3-4B-Instruct-2507 --target Qwen/Qwen3-8B --out runs/q3-4b-8b
+kvtransfer harness    --source ... --target ... --mapper runs/q3-4b-8b/mappers/k8 --tasks arc_challenge,hellaswag
+kvtransfer serve      --source ... --target ... --mapper runs/q3-4b-8b/mappers/k8 --port 8765
+```
+
+`experiment` runs the paper's whole protocol on one pair (plan, calibrate, k sweep, held-out
+diagnostics, Table 2 ablations, latency with energy, multi-turn drift) and writes `report.md`;
+`harness` gives downstream accuracy retention through lm-evaluation-harness, the paper's metric;
+`serve` is a small-model-then-escalate service that reports skipped tokens, mapper time and joules
+per request. Mismatched-KV pairs (e.g. Qwen2.5-7B -> 14B, 4 vs 8 KV heads) run with
+`--allow-mismatched` as a research extension the paper did not test.
+
 ## Command line
 
 ```bash
@@ -110,8 +136,10 @@ sess.feed(ids); sess.generate(32); sess.switch_to("large"); sess.feed(more_ids);
 | Sec. 4.5 attention-output cosine as the retention predictor; R² as a within-pair diagnostic | `metrics.evaluate` (also logit KL and top-1 agreement vs. the target's own prefill) |
 | Sec. 4.6 multi-turn handoff | `transfer.Session` |
 | Sec. 4.7 mapper vs. re-prefill latency | `bench.benchmark` |
+| Sec. 4.3 / Table 2 ablations (-all RoPE, -inference RoPE, k=1) | `Mapper.fit(key_space="rope")`, `Mapper.ablate_inference_rope()`, `experiment` stage `ablation` |
+| Sec. 4.1 benchmarks and retention / floor-normalized retention | `lm_eval_adapter.TransferLM` (`--model kvtransfer` in lm-eval), `retention_table`, `kvtransfer harness` |
 | Sec. 4.4 MLP mapper for the pairs where ridge fails | not implemented |
-| Downstream benchmarks (ARC, HellaSwag, MMLU, GSM8K, CoQA) | not bundled; use lm-evaluation-harness on the target with an injected cache, or the diagnostics above |
+| App. B greedy forward selection, App. C lambda/N/domain sweeps | not implemented (fixed top-k by single-source R2 is the paper's production choice) |
 
 One implementation choice the paper leaves implicit: to get the target's first logit you need one
 target forward pass, so the last `hold_back` prompt tokens (default 1) are not mapped but run through

@@ -83,25 +83,84 @@ def tokenizer_fingerprint(tok) -> str:
     return h.hexdigest()[:16]
 
 
-def assert_shared_tokenizer(tok_a, tok_b) -> None:
-    if tok_a.get_vocab() != tok_b.get_vocab():
-        raise ValueError("source and target tokenizers differ; token positions would not align")
+SAMPLE_TEXTS = (
+    "The quick brown fox jumps over the lazy dog. 1234567890 !@#$%^&*()",
+    "def f(x):\n    return {'a': x ** 2, 'b': [x, x + 1]}\n",
+    "Photosynthesis converts light energy into chemical energy in plants, algae and some bacteria.",
+    "Résumé — naïve café; 東京 · Москва · القاهرة · 🙂",
+)
+
+
+def tokenizer_compatibility(tok_a, tok_b, texts=SAMPLE_TEXTS) -> str:
+    """'identical' (same vocab map), 'compatible' (same ids on sample texts, e.g. Qwen2.5 vs Qwen3
+    tokenizers, which share the BPE), or 'incompatible' (token positions would not align)."""
+    if tok_a.get_vocab() == tok_b.get_vocab():
+        return "identical"
+    for t in texts:
+        if tok_a(t, add_special_tokens=False)["input_ids"] != tok_b(t, add_special_tokens=False)["input_ids"]:
+            return "incompatible"
+    return "compatible"
+
+
+def assert_shared_tokenizer(tok_a, tok_b, allow_compatible: bool = True) -> str:
+    level = tokenizer_compatibility(tok_a, tok_b)
+    if level == "incompatible" or (level == "compatible" and not allow_compatible):
+        raise ValueError(f"source and target tokenizers are {level}; token positions would not align")
+    return level
 
 
 def load_model(model_id: str, device: str | torch.device | None = None, dtype=None, attn_implementation=None,
-               **kwargs) -> torch.nn.Module:
-    """Load a causal LM in eval mode.  bf16 on CUDA, fp32 on CPU unless ``dtype`` is given."""
+               device_map=None, **kwargs) -> torch.nn.Module:
+    """Load a causal LM in eval mode.  bf16 on CUDA, fp32 on CPU unless ``dtype`` is given.
+
+    ``attn_implementation`` defaults to ``"sdpa"``: it is what works everywhere, including the DGX
+    Spark (sm_121), where flash-attn has no wheels.  Pass ``"flash_attention_2"`` explicitly to use it.
+    ``device_map`` (e.g. ``"auto"``) is forwarded to transformers for sharded loading; the model is
+    then left where transformers put it instead of being moved to ``device``.
+    """
     dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if dtype is None:
         dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
     kw = dict(kwargs)
-    if attn_implementation:
-        kw["attn_implementation"] = attn_implementation
+    kw["attn_implementation"] = attn_implementation or "sdpa"
+    if device_map is not None:
+        kw["device_map"] = device_map
     try:
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, **kw)
     except TypeError:  # transformers < 5
         model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype, **kw)
-    return model.to(dev).eval()
+    if device_map is None:
+        model = model.to(dev)
+    return model.eval()
+
+
+def load_pair(source_id: str, target_id: str, device=None, dtype=None, attn_implementation=None, **kwargs):
+    """Load source and target (same device/dtype) plus the shared tokenizer, checking the tokenizers agree."""
+    src = load_model(source_id, device=device, dtype=dtype, attn_implementation=attn_implementation, **kwargs)
+    tgt = load_model(target_id, device=device, dtype=dtype, attn_implementation=attn_implementation, **kwargs)
+    tok = load_tokenizer(source_id, **{k: v for k, v in kwargs.items() if k == "trust_remote_code"})
+    assert_shared_tokenizer(tok, load_tokenizer(target_id, **{k: v for k, v in kwargs.items() if k == "trust_remote_code"}))
+    return src, tgt, tok
+
+
+def encode_prompt(tokenizer, prompt: str | list, chat: bool = False, system: str | None = None,
+                  enable_thinking: bool | None = None) -> torch.Tensor:
+    """Tokenize a raw string or, with ``chat=True``, a user message (or a list of chat messages)
+    through the tokenizer's chat template with the generation prompt appended.  Returns [1, T]."""
+    if not chat:
+        return tokenizer(prompt, return_tensors="pt")["input_ids"]
+    msgs = prompt if isinstance(prompt, list) else ([{"role": "system", "content": system}] if system else []) + [
+        {"role": "user", "content": prompt}]
+    kw = {}
+    if enable_thinking is not None:
+        kw["enable_thinking"] = enable_thinking   # Qwen3 templates accept this
+    try:
+        ids = tokenizer.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", **kw)
+    except TypeError:
+        ids = tokenizer.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
+    if not isinstance(ids, torch.Tensor):
+        ids = ids["input_ids"]
+    return ids
 
 
 def load_tokenizer(model_id: str, **kwargs):
@@ -185,13 +244,22 @@ def forward_with_cache(model, cache, input_ids: torch.Tensor, past_len: int | No
 
 
 def decoder_layers(model) -> list:
+    for path in (("model", "layers"), ("model", "language_model", "layers"), ("language_model", "model", "layers"),
+                 ("language_model", "layers"), ("layers",)):
+        obj = model
+        for name in path:
+            obj = getattr(obj, name, None)
+            if obj is None:
+                break
+        else:
+            return list(obj)
+    raise ValueError("cannot locate decoder layers on this model")
+
+
+def transformer_body(model):
+    """The decoder without the LM head (what the paper times as 're-prefill')."""
     base = getattr(model, "model", model)
-    layers = getattr(base, "layers", None)
-    if layers is None and hasattr(base, "language_model"):
-        layers = base.language_model.layers
-    if layers is None:
-        raise ValueError("cannot locate decoder layers on this model")
-    return list(layers)
+    return base
 
 
 def spec_json(spec: ModelSpec) -> str:
