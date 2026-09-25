@@ -78,3 +78,27 @@ def test_ollama_manifests_and_hf_suggestions(tmp_path):
     assert hf_suggestion("qwen3:30b-a3b-instruct-2507-q4_K_M") == "Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert hf_suggestion("llama3.2:1b") == "meta-llama/Llama-3.2-1B-Instruct"
     assert hf_suggestion("mystery:1b") is None
+
+
+def test_scan_ollama_skips_unreadable_store(tmp_path):
+    """A store owned by another user (e.g. /usr/share/ollama) must be skipped and reported, not raise."""
+    import os
+    import pytest
+    if os.geteuid() == 0:
+        pytest.skip("root can read everything")
+    good = tmp_path / "good"
+    tag = good / "manifests" / "registry.ollama.ai" / "library" / "qwen3" / "8b"
+    tag.parent.mkdir(parents=True)
+    tag.write_text(json.dumps({"layers": [{"size": 5_000_000_000}]}))
+    locked = tmp_path / "locked"
+    (locked / "manifests").mkdir(parents=True)
+    locked.chmod(0o000)
+    try:
+        unreadable: list[str] = []
+        found = scan_ollama([locked, good], unreadable=unreadable, include_defaults=False)
+        assert [m.tag for m in found] == ["qwen3:8b"]
+        assert unreadable == [str(locked)]
+        assert scan_ollama([locked], include_defaults=False) == []   # without the out-parameter it is silently skipped
+        scan_ollama()                                                  # the default stores never raise either
+    finally:
+        locked.chmod(0o755)

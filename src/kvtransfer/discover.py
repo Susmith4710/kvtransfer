@@ -241,19 +241,34 @@ def scan(roots: Iterable[str | Path] = (), include_hf_cache: bool = True) -> lis
     return out
 
 
-def scan_ollama(roots: Iterable[str | Path] = ()) -> list[OllamaModel]:
-    cands = [Path(r).expanduser() for r in roots] + [
-        Path(os.environ.get("OLLAMA_MODELS", "")) if os.environ.get("OLLAMA_MODELS") else Path("/nonexistent"),
-        Path("~/.ollama/models").expanduser(), Path("/usr/share/ollama/.ollama/models"), Path("/root/.ollama/models"),
-    ]
+def scan_ollama(roots: Iterable[str | Path] = (), unreadable: list[str] | None = None,
+                include_defaults: bool = True) -> list[OllamaModel]:
+    """List Ollama (GGUF) models from the given roots plus, by default, the usual store locations.
+
+    A store that exists but cannot be read (the system-wide ``/usr/share/ollama`` store is owned by
+    the ``ollama`` user on most installs) is skipped rather than raising; its root is appended to
+    ``unreadable`` when a list is given, so callers can tell the user why it is missing.
+    """
+    cands = [Path(r).expanduser() for r in roots]
+    if include_defaults:
+        cands += [
+            Path(os.environ.get("OLLAMA_MODELS", "")) if os.environ.get("OLLAMA_MODELS") else Path("/nonexistent"),
+            Path("~/.ollama/models").expanduser(), Path("/usr/share/ollama/.ollama/models"), Path("/root/.ollama/models"),
+        ]
     out = []
     for root in cands:
         man = root / "manifests"
-        if not man.exists():
-            continue
-        for path in man.rglob("*"):
-            if not path.is_file():
+        try:
+            if not man.is_dir():
                 continue
+            files = [p for p in man.rglob("*") if p.is_file()]
+        except PermissionError:
+            if unreadable is not None:
+                unreadable.append(str(root))
+            continue
+        except OSError:
+            continue
+        for path in files:
             rel = path.relative_to(man).parts  # registry / library / name / tag
             if len(rel) < 4:
                 continue

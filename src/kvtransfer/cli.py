@@ -200,10 +200,13 @@ def cmd_discover(args):
         print("\nSame-family pairs with mismatched KV (research extension, --allow-mismatched):")
         for a, b, why in mm:
             print(f"  {a.name} <-> {b.name}: {why}")
-    ol = scan_ollama(args.ollama_dir or ())
+    unreadable: list[str] = []
+    ol = scan_ollama(args.ollama_dir or (), unreadable=unreadable)
     if ol:
         print()
         print(format_ollama(ol))
+    for root in unreadable:
+        print(f"\nnote: Ollama store {root} is not readable by this user (skipped); `ollama list` shows its models")
     if args.json:
         Path(args.json).write_text(json.dumps({"models": [m.to_dict() for m in models], "pairs": [p.to_dict() for p in pairs],
                                                "ollama": [o.__dict__ for o in ol]}, indent=2))
