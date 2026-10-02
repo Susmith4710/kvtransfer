@@ -22,7 +22,20 @@ Docs: `README.md` (API + CLI), `docs/DGX_SPARK.md` (runbook for this machine), `
   the system Python, system torch, CUDA toolkit or driver. Use `scripts/dgx_spark/setup_venv.sh`
   (creates `~/.venvs/kvtransfer`) and `source ~/.venvs/kvtransfer/bin/activate`. `run_tiers.sh`
   refuses to run outside a venv; `kvtransfer doctor` warns.
+* **Sustained GPU load powers this machine off.** Unthrottled calibration took the SoC from 39 C to
+  85 C in 33 s and shut the box down twice (2026-09-30), with no log entry and a manual power cycle
+  each time. The thermal governor (`src/kvtransfer/thermal.py`) is on by default on the GB10; never
+  disable it, never write a new sustained GPU loop without a `thermal.checkpoint()`, and use
+  `--batch-size 2`. Details and measurements: `docs/DGX_SPARK.md` section 0.
+* **Launch every long job with `scripts/dgx_spark/run_detached.sh <unit> <log> -- <command>`.** It
+  runs the job as a systemd user service (a background job of an agent session dies with the
+  session), under the governor, a 100 GiB cap, and `memwatch.sh`, which kills the job on low memory
+  or high temperature. Check with `systemctl --user is-active <unit>`; the log ends with `exit <code>`.
 * Do not modify the VortexEdge inference-pod repository. This repo is a standalone test bed.
+* The box is shared. Do not touch, query or restart anything other users rely on: the inference-pod
+  project and its monitoring containers (Prometheus, Grafana), the DCGM exporter, Ollama, other
+  users' processes. For telemetry use `scripts/dgx_spark/telemetry.py`, which reads only this machine's
+  own sensors.
 * The pod's production engine is Ollama (GGUF). Ollama cannot export or import a KV cache, so the
   models pulled through Ollama cannot be used here; the Hugging Face checkpoints must be downloaded
   separately (`huggingface-cli download <id> --local-dir <dir>`).
@@ -44,6 +57,7 @@ paper-faithful control needs one sibling download: `Qwen/Qwen3-8B` (pairs with Q
 
 1. Tier 1, paper-faithful control: `kvtransfer experiment --source Qwen/Qwen3-4B-Instruct-2507
    --target Qwen/Qwen3-8B --out runs/qwen3-4b-to-8b --hardware dgx-spark`, then `kvtransfer harness`.
+   Done; see `docs/RESULTS_TIER1.md`.
 2. Tier 2, the pod's real escalation pair: same with Qwen2.5-7B -> Qwen2.5-14B and `--allow-mismatched`.
 3. Tier 3, the pod's flow: `kvtransfer serve` (small model answers, large model continues from the
    mapped cache; reports skipped tokens, mapper ms, joules).
@@ -53,12 +67,17 @@ Local checkpoint paths can be passed anywhere an HF id is accepted. `kvtransfer 
 
 ## State of the code
 
-* 82 offline tests (`pytest`, CPU, tiny random models, ~5 s). They verify the mathematics and the
+* 99 offline tests (`pytest`, CPU, tiny random models, ~10 s). They verify the mathematics and the
   plumbing (identity pair reproduces native logits exactly, also beyond the calibration length),
   not the paper's accuracy numbers.
-* Nothing has run on real models yet. The first real numbers come from the Spark. Read
-  `runs/<pair>/report.md` against the paper: Tier 1 pairs there retain 73-98 %; attention-output
-  cosine is the paper's cross-pair predictor, R2 is not.
+* **Tier 1 has run on the real pair** (Qwen3-4B -> Qwen3-8B, 2026-10-01). Results and how they
+  compare with the paper are in `docs/RESULTS_TIER1.md`; raw outputs are under
+  `runs/qwen3-4b-to-8b/` (not committed). Best k is 12 by held-out attention-output cosine (0.899).
+* Tier 2 (Qwen2.5-7B -> 14B, mismatched KV) and Tier 3 (`kvtransfer serve`) have not run. Tier 2
+  needs the bf16 Hugging Face checkpoints, which are not on disk (the pod uses AWQ builds).
+* The experiment runner is memory-disciplined for unified memory: models are unloaded during ridge
+  solves, mappers are loaded one at a time, statistics are dropped when no longer needed, and a fit
+  whose target layers share their source layers (always true for k = all) factors the Gram once.
 * An adversarial review against the paper text was done; its findings are fixed and listed in
   `docs/PAPER_VERIFICATION.md`, along with what is deliberately not implemented (MLP mapper,
   greedy selection, lambda/N/domain sweeps, error-concentration diagnostics, WikiText prefix

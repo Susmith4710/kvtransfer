@@ -36,11 +36,12 @@ pytest kvtransfer                    # offline CPU suite, tiny random models, ~3
 
 ## Testing on a DGX Spark against a specific fleet
 
-* `docs/DGX_SPARK.md`: environment, memory rules for unified memory, which pairs fit, the three
-  experiments to run in order, how to read the numbers.
+* `docs/DGX_SPARK.md`: **thermal limits (read section 0 before any long run)**, environment, memory
+  rules for unified memory, which pairs fit, the three experiments to run in order, how to read the numbers.
 * `docs/VORTEXEDGE.md`: where transfer fits a memory-first pod's SYNTHESIZE -> ESCALATE flow, why
   Ollama/GGUF cannot be used directly, prefix sharing, the escalation server, what integration would look like.
 * `docs/PAPER_VERIFICATION.md`: every paper claim mapped to the code and to the test that checks it.
+* `docs/RESULTS_TIER1.md`: the first real-model results (Qwen3-4B → Qwen3-8B on the Spark) against the paper.
 * `scripts/dgx_spark/run_tiers.sh`: the three tiers end to end.
 
 ```bash

@@ -55,6 +55,10 @@ paper's accuracy numbers, which require the real checkpoints (see `docs/DGX_SPAR
 
 ## Things the tests cannot verify
 
+First real-model measurements (Qwen3-4B → Qwen3-8B, 2026-10-01) are in `docs/RESULTS_TIER1.md`: 95.4 %
+average retention at k = 12 on three benchmarks, the RoPE ablation ordering reproduced, and a 2× mapper
+speedup, below the paper's range.
+
 Accuracy retention, the 73–98 % / 42 % tier split, the 2.7–25× latency ratios, and the
 attention-cosine/retention correlation all need the real checkpoints and hardware. The Spark
 runbook produces exactly those numbers; the tests only guarantee that the pipeline reproduces a
