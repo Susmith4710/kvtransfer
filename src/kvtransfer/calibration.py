@@ -22,6 +22,7 @@ from typing import Iterable, Sequence
 import torch
 from safetensors.torch import load_file, save_file
 
+from . import thermal
 from .hf import ModelSpec, cache_layer, check_matched_kv, model_spec
 from .ridge import MomentAccumulator
 from .rope import RopeCodec
@@ -163,4 +164,5 @@ def calibrate(
         del src_out, tgt_out
         if progress:
             print(f"[calibrate] batch {i + 1}: {stats.n_seqs} sequences, {stats.acc[kinds[0]].n} tokens", flush=True)
+        thermal.checkpoint()        # no-op unless a thermal governor is configured
     return stats

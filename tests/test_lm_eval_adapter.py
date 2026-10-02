@@ -270,3 +270,43 @@ def test_run_harness_requires_lm_eval_message(monkeypatch):
     monkeypatch.setattr(mod, "_LM_EVAL_IMPORT_ERROR", ImportError("nope"))
     with pytest.raises(ImportError, match="lm-evaluation-harness is required"):
         mod.run_harness("s", "t", "m", ["arc_challenge"])
+
+
+def test_run_harness_saves_each_part_and_resumes(tmp_path, monkeypatch):
+    """Each of the three evaluations is written when it finishes; a rerun reuses them without evaluating."""
+    import lm_eval
+
+    import kvtransfer.lm_eval_adapter as mod
+    from kvtransfer import thermal
+
+    calls, hooks = [], []
+
+    class FakeModule:
+        def register_forward_pre_hook(self, fn):
+            hooks.append(fn)
+
+    class FakeHFLM:
+        def __init__(self, pretrained, **kw):
+            self.pretrained, self.model = pretrained, FakeModule()
+
+    def fake_eval(model=None, model_args=None, **kw):
+        name = model.pretrained if isinstance(model, FakeHFLM) else "transfer"
+        calls.append(name)
+        acc = {"tgt": 0.8, "src": 0.5, "transfer": 0.7}[name]
+        return {"results": {"arc_challenge": {"acc,none": acc}}, "samples": object()}
+
+    monkeypatch.setattr(mod, "HFLM", FakeHFLM)
+    monkeypatch.setattr(lm_eval, "simple_evaluate", fake_eval)
+    thermal.configure(70, 60, read=lambda: 40, sleep=lambda s: None, log=lambda m: None)
+    try:
+        res = mod.run_harness("src", "tgt", "mapper_dir", ["arc_challenge"], device="cpu", cache_dir=str(tmp_path / "parts"))
+    finally:
+        thermal.configure(None)
+    assert calls == ["tgt", "src", "transfer"]
+    assert len(hooks) == 2 and hooks[0](None, ()) is None          # governed baselines; the hook leaves inputs alone
+    assert sorted(p.name for p in (tmp_path / "parts").iterdir()) == ["source.json", "target.json", "transfer.json"]
+    row = res["retention"][0]
+    assert abs(row["retention_pct"] - 87.5) < 1e-9 and abs(row["normalized_retention_pct"] - 100 * 0.45 / 0.55) < 1e-9
+    res2 = mod.run_harness("src", "tgt", "mapper_dir", ["arc_challenge"], device="cpu", cache_dir=str(tmp_path / "parts"))
+    assert calls == ["tgt", "src", "transfer"]                      # nothing re-evaluated
+    assert res2["retention"][0]["retention_pct"] == row["retention_pct"]

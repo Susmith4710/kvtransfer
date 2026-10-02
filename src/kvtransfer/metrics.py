@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from . import thermal
 from .hf import cache_layer, cache_num_layers, cache_to_list, decoder_layers, forward_with_cache, prefill, crop_cache
 from .mapper import Mapper
 from .ridge import r2_score
@@ -94,6 +95,7 @@ def evaluate(source_model, target_model, mapper: Mapper, sequences, prefix_len: 
             ids = ids[None]
         if ids.shape[1] < prefix_len + suffix_len:
             continue
+        thermal.checkpoint()
         prefix = ids[:, :prefix_len]
         suffix = ids[:, prefix_len:prefix_len + suffix_len]
         rep.n_sequences += 1

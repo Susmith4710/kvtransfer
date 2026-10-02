@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 
+from . import thermal
 from .calibration import CalibrationStats
 from .hf import ModelSpec, cache_layer, cache_num_layers, list_to_cache
 from .rope import RopeCodec
@@ -84,21 +85,47 @@ class Mapper:
         for kind in (k_kind, "V"):
             if kind not in stats.acc:
                 raise ValueError(f"calibration stats lack kind {kind!r}; needed for key_space={key_space!r}")
-        r2s = {"K": [], "V": []}
-        for lt in range(stats.target.n_layers):
-            rows = stats.src_rows(selected[lt].tolist())
-            cols = stats.tgt_cols(lt)
+        Lt = stats.target.n_layers
+        W = {"K": [None] * Lt, "V": [None] * Lt}
+        B = {"K": [None] * Lt, "V": [None] * Lt}
+        r2s = {"K": [None] * Lt, "V": [None] * Lt}
+
+        def store(lt: int, kind: str, acc, w, b, resid) -> None:
+            W[kind][lt] = w.float().cpu()
+            B[kind][lt] = b.float().cpu()
+            # paper reports head-averaged R^2 (Table 7 / App. B), not pooled over the layer's columns
+            r2s[kind][lt] = float(np.nanmean(acc.block_r2(*resid, block=stats.target.head_dim)))
+
+        # Target layers that select the same set of source layers share one regularised Gram; it is
+        # factored once per group (always the case for k = all, where a fit drops from 2*L_t to 2
+        # factorisations).  A target layer with a unique set keeps the direct per-layer solve.
+        groups: dict = {}
+        for lt in range(Lt):
+            groups.setdefault(tuple(sorted(int(x) for x in selected[lt])), []).append(lt)
+        w_src = stats.source.kv_width
+        for layers, lts in groups.items():
             for kind in ("K", "V"):
                 acc = stats.acc[k_kind if kind == "K" else "V"]
-                w, b, _pooled = acc.solve(lam, rows=rows, cols=cols, solve_dtype=solve_dtype)
-                (m.W_K if kind == "K" else m.W_V).append(w.float().cpu())
-                (m.b_K if kind == "K" else m.b_V).append(b.float().cpu())
-                # paper reports head-averaged R^2 (Table 7 / App. B), not pooled over the layer's columns
-                per_head = acc.block_r2(*acc.last_column_residuals, block=stats.target.head_dim)
-                r2s[kind].append(float(np.nanmean(per_head)))
+                if len(lts) == 1:
+                    lt = lts[0]
+                    w, b, _pooled = acc.solve(lam, rows=stats.src_rows(selected[lt].tolist()), cols=stats.tgt_cols(lt),
+                                              solve_dtype=solve_dtype)
+                    store(lt, kind, acc, w, b, acc.last_column_residuals)
+                    thermal.checkpoint()
+                    continue
+                rows = stats.src_rows(list(layers))                       # canonical (sorted) order for the group
+                slot = {l: i for i, l in enumerate(layers)}
+                solved = acc.solve_shared(lam, rows, [stats.tgt_cols(lt) for lt in lts], solve_dtype=solve_dtype)
+                for lt, (w, b, _pooled, resid) in zip(lts, solved):
+                    # reorder the rows of W from the canonical order to this layer's own (best-first) order
+                    perm = torch.cat([torch.arange(slot[int(l)] * w_src, (slot[int(l)] + 1) * w_src) for l in selected[lt]])
+                    store(lt, kind, acc, w[perm.to(w.device)], b, resid)
+                    thermal.checkpoint()
             if progress:
-                print(f"[fit] target layer {lt}: src {selected[lt].tolist()} R2 K={r2s['K'][-1]:.3f} V={r2s['V'][-1]:.3f}",
-                      flush=True)
+                for lt in lts:
+                    print(f"[fit] target layer {lt}: src {selected[lt].tolist()} R2 K={r2s['K'][lt]:.3f} V={r2s['V'][lt]:.3f}",
+                          flush=True)
+        m.W_K, m.b_K, m.W_V, m.b_V = W["K"], B["K"], W["V"], B["V"]
         m.fit_r2 = r2s
         m.meta["selection_score"] = score.tolist()
         return m

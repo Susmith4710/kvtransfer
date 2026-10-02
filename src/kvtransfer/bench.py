@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
+from . import thermal
 from .hf import cache_to_list, prefill
 from .mapper import Mapper
 from .rope import RopeCodec
@@ -35,6 +36,21 @@ def _sync(dev):
 
 
 def _timeit(fn, dev, warmup: int, trials: int) -> float:
+    if thermal.enabled():
+        # Thermally governed machines: finish each call before the next one starts, so the governor
+        # can pause between calls and its pauses stay outside the timed region.
+        for _ in range(warmup):
+            fn()
+            _sync(dev)
+            thermal.checkpoint()
+        total = 0.0
+        for _ in range(trials):
+            t0 = time.perf_counter()
+            fn()
+            _sync(dev)
+            total += time.perf_counter() - t0
+            thermal.checkpoint()
+        return total * 1000.0 / trials
     for _ in range(warmup):
         fn()
     _sync(dev)

@@ -51,6 +51,36 @@ def test_state_dict_round_trip():
     assert torch.equal(W1, W2) and torch.equal(b1, b2) and r1 == r2
 
 
+def test_solve_shared_matches_per_block_solve():
+    """One LU factorisation reused across column blocks must give what a separate solve per block gives."""
+    X, Y, _, _ = _planted(p=16, q=12, noise=0.3)
+    acc = MomentAccumulator(16, 12)
+    for i in range(0, X.shape[0], 1000):
+        acc.update(X[i:i + 1000], Y[i:i + 1000])
+    rows = torch.tensor([9, 8, 0, 1, 2, 3, 14])
+    blocks = [torch.arange(0, 4), torch.arange(4, 8), torch.tensor([11, 8])]
+    shared = list(acc.solve_shared(0.01, rows, blocks))
+    assert len(shared) == 3
+    for cols, (w, b, r2, (ss_res_c, syy_c)) in zip(blocks, shared):
+        w_ref, b_ref, r2_ref = acc.solve(0.01, rows=rows, cols=cols)
+        res_ref, syy_ref = acc.last_column_residuals
+        assert torch.allclose(w, w_ref, atol=1e-5) and torch.allclose(b, b_ref, atol=1e-4)
+        assert abs(r2 - r2_ref) < 1e-9
+        assert torch.allclose(ss_res_c, res_ref, rtol=1e-6, atol=1e-6) and torch.equal(syy_c, syy_ref)
+
+
+def test_solve_shared_falls_back_on_singular_gram():
+    """lam = 0 with a dead feature gives an exactly singular Gram: same answer as solve()'s own fallback."""
+    X, Y, _, _ = _planted(n=500, p=6, q=4, shift=0.0)
+    X[:, 2] = 0.0
+    acc = MomentAccumulator(6, 4)
+    acc.update(X, Y)
+    rows, blocks = torch.arange(6), [torch.arange(0, 2), torch.arange(2, 4)]
+    for cols, (w, b, r2, _) in zip(blocks, acc.solve_shared(0.0, rows, blocks)):
+        w_ref, b_ref, r2_ref = acc.solve(0.0, rows=rows, cols=cols)
+        assert torch.equal(w, w_ref) and torch.equal(b, b_ref) and r2 == r2_ref
+
+
 def test_r2_of_pure_noise_is_near_zero():
     g = torch.Generator().manual_seed(1)
     X = torch.randn(5000, 8, generator=g)

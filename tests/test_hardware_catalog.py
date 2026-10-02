@@ -109,3 +109,16 @@ def test_analyze_tags_pod_list_has_no_paper_pair_and_suggests_siblings():
     assert fits[("Qwen2.5-7B-Instruct", "Qwen2.5-14B-Instruct")]
     from kvtransfer.catalog import format_analysis
     assert "mismatched-kv" in format_analysis(a)
+
+
+def test_plan_counts_the_ablation_statistics_and_the_fit_peak():
+    """The experiment collects K, V and K_rope; the plan must budget three kinds and report the solve peak."""
+    a, b = BY_ID["Qwen/Qwen3-4B-Instruct-2507"], BY_ID["Qwen/Qwen3-8B"]
+    plan = hw.PairPlan(a.cost(), b.cost(), "bfloat16", 500, 1024, 4, 4, k_values=(1, 8, "all"))
+    two, three = plan.fit(hw.DGX_SPARK), plan.fit(hw.DGX_SPARK, kinds=3)
+    assert three["calibration_kinds"] == 3 and two["calibration_kinds"] == 2
+    assert abs((three["peak_gib"] - two["peak_gib"]) - two["stats_gib_per_kind"]) < 0.2
+    n = 36 * 8 * 128                                   # k = all: every source layer, all KV heads
+    assert plan.solve_transient_bytes("all") == 3 * n * n * 8
+    assert three["fit_peak_gib"] == round((plan.stats_bytes(3) + 3 * n * n * 8) / hw.GIB, 1)
+    assert "ridge solves" in hw.format_plan(plan, three) and "3 kinds" in hw.format_plan(plan, three)

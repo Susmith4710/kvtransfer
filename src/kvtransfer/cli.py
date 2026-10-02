@@ -261,7 +261,8 @@ def cmd_harness(args):
     from .lm_eval_adapter import retention_summary, run_harness
     res = run_harness(args.source, args.target, args.mapper, tasks=args.tasks.split(","), device=args.device or "cuda",
                       dtype=args.dtype or "auto", limit=args.limit, hold_back=args.hold_back,
-                      num_fewshot=args.num_fewshot, batch_size=args.batch_size)
+                      num_fewshot=args.num_fewshot, batch_size=args.batch_size,
+                      cache_dir=str(Path(args.out).with_suffix("")) + "_parts" if args.out else None)
     rows = res["retention"]
     print(f"{'task':22} {'metric':22} {'source':>7} {'target':>7} {'transfer':>8} {'retention':>9} {'floor-norm':>10}")
     def f(x, w=7):

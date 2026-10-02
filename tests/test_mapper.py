@@ -106,3 +106,21 @@ def test_content_space_mapper_generalizes_past_calibration_length(src_model):
     lo_mapped = forward_with_cache(src_model, list_to_cache(mapped, src_model), ids[:, 200:], past_len=200).logits
     assert torch.allclose(lo_mapped, out.logits[:, 200:], atol=2e-2)
     assert torch.equal(lo_mapped.argmax(-1), out.logits[:, 200:].argmax(-1))
+
+
+def test_fit_with_shared_source_sets_matches_per_layer_solves(src_model, tgt_model, calib_batches):
+    """k = all: every target layer selects the same source layers, so the fit factors one Gram per kind.
+    The result must equal a direct solve per target layer, with W's rows in that layer's own order."""
+    stats = calibrate(src_model, tgt_model, calib_batches, stride=2)
+    score = selection_score(stats)["mean"]
+    m = Mapper.fit(stats, k="all", lam=0.01, score=score)
+    assert m.k == 3 and len(m.W_K) == len(m.W_V) == 4
+    assert len({tuple(row) for row in m.selected.tolist()}) > 1      # orders differ, the set is shared
+    for lt in range(4):
+        rows, cols = stats.src_rows(m.selected[lt].tolist()), stats.tgt_cols(lt)
+        for kind, W, b, r2 in (("K", m.W_K, m.b_K, m.fit_r2["K"]), ("V", m.W_V, m.b_V, m.fit_r2["V"])):
+            acc = stats.acc[kind]
+            w_ref, b_ref, _ = acc.solve(0.01, rows=rows, cols=cols)
+            r2_ref = float(np.nanmean(acc.block_r2(*acc.last_column_residuals, block=16)))
+            assert torch.allclose(W[lt], w_ref, atol=1e-4) and torch.allclose(b[lt], b_ref, atol=1e-4)
+            assert abs(r2[lt] - r2_ref) < 1e-6

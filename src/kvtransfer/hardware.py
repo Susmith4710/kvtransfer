@@ -62,6 +62,8 @@ DGX_SPARK = HardwareProfile(
     unified_memory=True, arch="aarch64", torch_version=">=2.9 (cu130)", cuda_version="13.0", bf16=True,
     flash_attn=False, recommended_attn="sdpa", safe_fraction=0.8,
     notes=[
+        "Thermal: sustained GPU load powers this machine off within minutes. The thermal governor is on by "
+        "default here (kvtransfer.thermal); launch long jobs with scripts/dgx_spark/run_detached.sh and use --batch-size 2.",
         "Unified memory: GPU and CPU share the 128 GB pool; plan against 80 % of it, not against 'free'.",
         "nvidia-smi shows memory as N/A on GB10; use `free -h` (available) or this doctor.",
         "Install torch from the cu130 index (>= 2.9); cu12x wheels fail at import (only libcudart.so.13 exists).",
@@ -242,18 +244,32 @@ class PairPlan:
         gram = 2 * (2.0 * self.n_tokens() * (self.p ** 2 + self.p * self.q))
         return fwd + gram
 
+    def solve_transient_bytes(self, k) -> int:
+        """Peak transient of one fp64 ridge solve: the Gram block, its regularised copy and the LU factor."""
+        kk = self.source.n_layers if k == "all" else min(int(k), self.source.n_layers)
+        n = kk * self.source.kv_width
+        return int(3 * n * n * 8)
+
+    def fit_peak_bytes(self, kinds: int = 2) -> int:
+        """Statistics on the device plus the largest solve of the k sweep (the models are unloaded for it)."""
+        return self.stats_bytes(kinds) + max((self.solve_transient_bytes(k) for k in self.k_values), default=0)
+
     # ---- verdict -------------------------------------------------------------------------------
     def peak_bytes(self, kinds_per_pass: int = 2) -> int:
         return self.model_bytes + self.stats_bytes(kinds_per_pass) + self.calibration_activation_bytes()
 
-    def fit(self, hw: HardwareProfile) -> dict:
-        """Decide how (and whether) calibration fits in ``hw``'s usable budget."""
+    def fit(self, hw: HardwareProfile, kinds: int = 2) -> dict:
+        """Decide how (and whether) calibration fits in ``hw``'s usable budget.
+
+        ``kinds`` is the number of statistic kinds accumulated in one pass: 2 (K, V), or 3 when the
+        experiment also collects the rotated keys for the paper's RoPE ablation.
+        """
         budget = hw.usable_bytes
-        one_pass = self.peak_bytes(2)
+        one_pass = self.peak_bytes(kinds)
         two_pass = self.peak_bytes(1)
         models_only = self.model_bytes
         if one_pass <= budget:
-            mode, peak = "single pass (K and V together)", one_pass
+            mode, peak = ("single pass (K and V together)" if kinds <= 2 else "single pass (K, V and K_rope together)"), one_pass
         elif two_pass <= budget:
             mode, peak = "two passes (K then V)", two_pass
         elif models_only + self.calibration_activation_bytes() <= budget:
@@ -270,6 +286,8 @@ class PairPlan:
             "budget_gib": round(budget / GIB, 1),
             "models_gib": round(self.model_bytes / GIB, 1),
             "stats_gib_per_kind": round(self.stats_bytes(1) / GIB, 1),
+            "calibration_kinds": kinds,
+            "fit_peak_gib": round(self.fit_peak_bytes(kinds) / GIB, 1),
             "activations_gib": round(self.calibration_activation_bytes() / GIB, 1),
             "mappers": {str(k): round(self.mapper_bytes(k) / GIB, 2) for k in self.k_values},
             "calibration_tokens_per_head": self.n_tokens(),
@@ -318,8 +336,10 @@ def format_plan(plan: PairPlan, verdict: dict) -> str:
         f"{t.name} ({t.n_layers}L, {t.n_kv}x{t.head_dim}, {t.n_params / 1e9:.1f}B)",
         f"  calibration : {plan.n_seqs} x {plan.seq_len} tokens, stride {plan.stride}, batch {plan.batch_size} "
         f"-> {verdict['calibration_tokens_per_head']:,} tokens per head",
-        f"  memory      : models {verdict['models_gib']} GiB + stats {verdict['stats_gib_per_kind']} GiB/kind + "
+        f"  memory      : models {verdict['models_gib']} GiB + stats {verdict['stats_gib_per_kind']} GiB/kind"
+        f" x {verdict.get('calibration_kinds', 2)} kinds + "
         f"activations {verdict['activations_gib']} GiB; peak {verdict['peak_gib']} GiB vs budget {verdict['budget_gib']} GiB",
+        f"  ridge solves: peak {verdict.get('fit_peak_gib', 'n/a')} GiB at the largest k (statistics + one fp64 solve, models unloaded)",
         f"  verdict     : {'FITS' if verdict['fits'] else 'DOES NOT FIT'} - {verdict['mode']}; "
         f"recommended batch {verdict['recommended_batch_size']}; rough fit time {verdict['rough_fit_minutes']} min",
         f"  mappers     : " + ", ".join(f"k={k}: {g} GiB" for k, g in verdict["mappers"].items()),

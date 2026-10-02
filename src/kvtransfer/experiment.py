@@ -22,7 +22,9 @@ Stages (each resumable from files under ``out_dir``):
 """
 from __future__ import annotations
 
+import gc
 import json
+import os
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -31,11 +33,12 @@ import numpy as np
 import torch
 
 from . import hardware as hw
+from . import thermal
 from .bench import benchmark
 from .calibration import CalibrationStats, calibrate
 from .data import batches, iter_dataset, token_sequences
 from .energy import EnergyMeter
-from .hf import cache_to_list, forward_with_cache, list_to_cache, load_pair, model_spec, prefill
+from .hf import cache_to_list, forward_with_cache, list_to_cache, load_pair, load_tokenizer, model_spec, prefill
 from .mapper import Mapper
 from .metrics import evaluate
 from .rope import RopeCodec
@@ -120,7 +123,7 @@ def plan_from_configs(source: str, target: str, cfg: ExperimentConfig, profile: 
     plan = hw.PairPlan(costs[0], costs[1], dtype=cfg.dtype or ("bfloat16" if profile.device == "cuda" else "float32"),
                        n_seqs=cfg.n_seqs, seq_len=cfg.seq_len, stride=cfg.stride, batch_size=cfg.batch_size,
                        k_values=tuple(cfg.k_values))
-    verdict = plan.fit(profile)
+    verdict = plan.fit(profile, kinds=3 if cfg.ablation else 2)   # the ablation adds the K_rope statistics
     return {"profile": profile.to_dict(), "verdict": verdict, "text": hw.format_plan(plan, verdict)}
 
 
@@ -153,6 +156,7 @@ def multiturn_drift(source_model, target_model, mapper_st: Mapper, ids: torch.Te
     rows = []
     live = "s"
     for t, c in enumerate(chunks):
+        thermal.checkpoint()
         # alternate s, t, s, t ... when both mappers exist; otherwise s once, then t forever
         want = ("s" if t % 2 == 0 else "t") if mapper_ts is not None else ("s" if t == 0 else "t")
         if want != live and (live, want) in mappers:
@@ -171,7 +175,54 @@ def multiturn_drift(source_model, target_model, mapper_st: Mapper, ids: torch.Te
     return {"turns": rows, "kl_slope_per_turn": slope, "turn_tokens": turn_tokens, "alternating": mapper_ts is not None}
 
 
+def _free() -> None:
+    """Release Python garbage and cached CUDA blocks (matters where CPU and GPU share one memory pool)."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _weight_files(model_id: str) -> list[Path]:
+    """The safetensors files of a local checkpoint directory or of a hub id already in the cache."""
+    d = Path(model_id)
+    if not d.is_dir():
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            hit = try_to_load_from_cache(model_id, "config.json")
+            d = Path(hit).parent if isinstance(hit, str) else None
+        except Exception:  # noqa: BLE001 - best effort only
+            d = None
+    return sorted(d.glob("*.safetensors")) if d is not None else []
+
+
+def _release_page_cache(paths) -> None:
+    """Ask the kernel to drop its cached copy of files this process has finished with.
+
+    On unified-memory machines the page cache and CUDA allocations compete for the same pool, and
+    the driver wants genuinely free pages.  ``posix_fadvise(DONTNEED)`` is an unprivileged, per-file
+    hint: it needs no sudo, touches no other file and changes no system setting.  Best effort."""
+    for p in paths:
+        try:
+            fd = os.open(os.path.realpath(p), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.fsync(fd)                       # dirty pages of a file just written cannot be dropped
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except (OSError, AttributeError):
+            pass
+        finally:
+            os.close(fd)
+
+
 def run_experiment(cfg: ExperimentConfig, log=print) -> dict:
+    """Run the protocol stage by stage, resuming from the files under ``cfg.out_dir``.
+
+    Memory discipline, needed on unified-memory machines such as the DGX Spark: the models are
+    unloaded while ridge systems are solved, the calibration statistics are dropped once the fits
+    that need them are on disk, and mappers are loaded one at a time.  The peak is therefore the
+    largest single stage (calibration, the biggest solve, or models + one mapper), not their sum.
+    """
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     _json(out / "config.json", cfg.to_dict())
@@ -192,22 +243,55 @@ def run_experiment(cfg: ExperimentConfig, log=print) -> dict:
 
     src = tgt = tok = None
 
+    # The models are only ever reached through models(): binding them to a local of this function
+    # would keep them alive across unload_models().
     def models():
         nonlocal src, tgt, tok
         if src is None:
+            t0 = time.time()
             src, tgt, tok = load_pair(cfg.source, cfg.target, device=cfg.device, dtype=_dtype(cfg.dtype),
                                       attn_implementation=cfg.attn, trust_remote_code=cfg.trust_remote_code)
-        return src, tgt, tok
+            if next(src.parameters()).device.type == "cuda":     # the weights now live on the device
+                _release_page_cache(_weight_files(cfg.source) + _weight_files(cfg.target))
+            log(f"[models] loaded in {time.time() - t0:.0f}s")
+        return src, tgt
+
+    def unload_models():
+        nonlocal src, tgt
+        if src is not None:
+            src = tgt = None
+            _free()
+            log("[models] unloaded while ridge systems are solved")
+
+    def tokenizer():
+        nonlocal tok
+        if tok is None:
+            tok = load_tokenizer(cfg.source, trust_remote_code=cfg.trust_remote_code)
+        return tok
+
+    def stats_device():
+        if cfg.stats_device:
+            return cfg.stats_device
+        if cfg.device:
+            return cfg.device
+        return "cuda" if torch.cuda.is_available() else "cpu"
 
     seqs_cache: dict = {}
 
     def sequences(n: int, seq_len: int, skip: int = 0):
         key = (n, seq_len, skip)
         if key not in seqs_cache:
-            _, _, tk = models()
-            all_seqs = token_sequences(iter_dataset(cfg.data), tk, seq_len, n + skip)
+            all_seqs = token_sequences(iter_dataset(cfg.data), tokenizer(), seq_len, n + skip)
             seqs_cache[key] = all_seqs[skip:]
         return seqs_cache[key]
+
+    def held_out():
+        return sequences(cfg.eval_n_seqs, cfg.eval_seq_len, skip=cfg.n_seqs)
+
+    split = dict(prefix_len=cfg.eval_seq_len - cfg.eval_suffix_len, suffix_len=cfg.eval_suffix_len)
+
+    def mapper_dir(kk: int) -> Path:
+        return out / "mappers" / f"k{kk}"
 
     # ---- 2. calibrate -------------------------------------------------------------------------
     stats_dir = out / "stats"
@@ -215,68 +299,81 @@ def run_experiment(cfg: ExperimentConfig, log=print) -> dict:
     if "calibrate" in cfg.stages or "fit" in cfg.stages:
         if (stats_dir / "meta.json").exists():
             log(f"[calibrate] reusing {stats_dir}")
-            stats = CalibrationStats.load(stats_dir, device=cfg.stats_device)
         else:
-            s, t, _ = models()
             seqs = sequences(cfg.n_seqs, cfg.seq_len)
             kinds = ("K", "V", "Krope") if cfg.ablation else ("K", "V")
+            models()                          # load outside the timed region
             t0 = time.time()
             with EnergyMeter() as em:
-                stats = calibrate(s, t, batches(seqs, cfg.batch_size), stride=cfg.stride, kinds=kinds,
-                                  stats_device=cfg.stats_device, source_name=cfg.source, target_name=cfg.target,
+                stats = calibrate(*models(), batches(seqs, cfg.batch_size), stride=cfg.stride, kinds=kinds,
+                                  stats_device=stats_device(), source_name=cfg.source, target_name=cfg.target,
                                   require_matched_kv=not cfg.allow_mismatched, progress=True)
+            calib_s = time.time() - t0
             stats.save(stats_dir)
-            report["stages"]["calibrate"] = {"seconds": time.time() - t0, "n_seqs": stats.n_seqs, "tokens_per_head": stats.acc["K"].n,
+            _release_page_cache(stats_dir.glob("*.safetensors"))
+            report["stages"]["calibrate"] = {"seconds": calib_s, "n_seqs": stats.n_seqs, "tokens_per_head": stats.acc["K"].n,
                                              "energy": em.reading.to_dict() if em.reading else None}
-            log(f"[calibrate] done in {time.time() - t0:.0f}s")
+            log(f"[calibrate] done in {calib_s:.0f}s (+{time.time() - t0 - calib_s:.0f}s to save the statistics)")
 
     # ---- 3. fit -------------------------------------------------------------------------------
-    mappers: dict = {}
+    fitted: list = []
     if "fit" in cfg.stages:
-        score_path = out / "selection_r2.json"
-        if score_path.exists():
-            score = {k: np.asarray(v) for k, v in json.loads(score_path.read_text()).items()}
-        else:
-            score = selection_score(stats)
-            _json(score_path, {k: v.tolist() for k, v in score.items()})
-        Ls = stats.source.n_layers
+        Ls = int(json.loads((stats_dir / "meta.json").read_text())["source"]["n_layers"])
         ks = []
         for k in cfg.k_values:
             kk = Ls if k == "all" else int(k)
             if kk <= Ls and kk not in ks:
                 ks.append(kk)
+        score_path = out / "selection_r2.json"
+        pending = [kk for kk in ks if not (mapper_dir(kk) / "mapper.json").exists()]
+        if pending or not score_path.exists():
+            unload_models()                 # a solve's transient must not stack on top of the models
+            if stats is None:
+                stats = CalibrationStats.load(stats_dir, device=stats_device(), kinds=("K", "V"))
+        if score_path.exists():
+            score = {k: np.asarray(v) for k, v in json.loads(score_path.read_text()).items()}
+        else:
+            t0 = time.time()
+            score = selection_score(stats)
+            _json(score_path, {k: v.tolist() for k, v in score.items()})
+            log(f"[fit] layer-selection probe in {time.time() - t0:.0f}s")
         fit_rows = []
         for kk in ks:
-            d = out / "mappers" / f"k{kk}"
-            if (d / "mapper.json").exists():
-                m = Mapper.load(d)
-            else:
+            d = mapper_dir(kk)
+            if not (d / "mapper.json").exists():
                 t0 = time.time()
                 m = Mapper.fit(stats, k=kk, lam=cfg.lam, score=score["mean"])
                 m.save(d)
+                _release_page_cache(d.glob("*.safetensors"))
                 log(f"[fit] k={kk} in {time.time() - t0:.1f}s: {m.summary()}")
-            mappers[kk] = m
-            fit_rows.append({"k": kk, "n_params": m.n_params(), "gib_fp32": m.n_params() * 4 / hw.GIB,
-                             "r2_K": float(np.mean(m.fit_r2["K"])), "r2_V": float(np.mean(m.fit_r2["V"]))})
+                del m
+                _free()
+            mj = json.loads((d / "mapper.json").read_text())      # metadata only: the weights stay on disk
+            fit_rows.append({"k": kk, "n_params": mj["n_params"], "gib_fp32": mj["n_params"] * 4 / hw.GIB,
+                             "r2_K": float(np.mean(mj["fit_r2"]["K"])), "r2_V": float(np.mean(mj["fit_r2"]["V"]))})
+            fitted.append(kk)
         report["stages"]["fit"] = fit_rows
         _json(out / "fit.json", fit_rows)
+    stats = None                            # evaluation does not need the statistics; the ablation reloads two kinds
+    _free()
 
     # ---- 4. eval ------------------------------------------------------------------------------
     best_k = None
-    if "eval" in cfg.stages and mappers:
-        s, t, _ = models()
-        held = sequences(cfg.eval_n_seqs, cfg.eval_seq_len, skip=cfg.n_seqs)
+    if "eval" in cfg.stages and fitted:
         eval_rows = []
-        for kk, m in mappers.items():
+        for kk in fitted:
             p = out / f"eval_k{kk}.json"
             if p.exists():
                 rep = json.loads(p.read_text())
             else:
+                m = Mapper.load(mapper_dir(kk))
                 t0 = time.time()
-                r = evaluate(s, t, m, held, prefix_len=cfg.eval_seq_len - cfg.eval_suffix_len, suffix_len=cfg.eval_suffix_len)
+                r = evaluate(*models(), m, held_out(), **split)
                 rep = r.to_dict() | {"k": kk, "seconds": time.time() - t0}
                 _json(p, rep)
                 log(f"[eval] k={kk}: {r.summary().splitlines()[2].strip()} | KL mean {r.kl_mean:.3f} | top-1 {r.top1_agreement:.3f}")
+                del m, r
+                _free()
             eval_rows.append(rep)
         valid = [r for r in eval_rows if r.get("attn_cosine_mean") is not None]
         best = max(valid, key=lambda r: r["attn_cosine_mean"]) if valid else None
@@ -286,102 +383,135 @@ def run_experiment(cfg: ExperimentConfig, log=print) -> dict:
                                               | {"r2_K": float(np.mean(r["r2_K"])), "r2_V": float(np.mean(r["r2_V"]))}
                                               for r in eval_rows],
                                     "best_k": best_k, "criterion": "max mean attention-output cosine"}
-    if best_k is None and mappers:
-        best_k = max(mappers)
+    if best_k is None and fitted:
+        best_k = max(fitted)
     report["best_k"] = best_k
 
     # ---- 5. ablation --------------------------------------------------------------------------
-    if "ablation" in cfg.stages and cfg.ablation and best_k is not None and stats is not None and "Krope" in stats.acc:
-        s, t, _ = models()
-        held = sequences(cfg.eval_n_seqs, cfg.eval_seq_len, skip=cfg.n_seqs)
+    stats_kinds = json.loads((stats_dir / "meta.json").read_text())["kinds"] if (stats_dir / "meta.json").exists() else []
+    if "ablation" in cfg.stages and cfg.ablation and best_k is not None and "Krope" in stats_kinds:
         p = out / "ablation.json"
         if p.exists():
             abl = json.loads(p.read_text())
         else:
             score = {k: np.asarray(v) for k, v in json.loads((out / "selection_r2.json").read_text()).items()}
-            # Table 2 rows, removed sequentially as in the paper
-            variants = {
-                "full (content-space)": mappers[best_k],
-                "-inference RoPE (content fit, no re-rotation)": mappers[best_k].ablate_inference_rope(),
-                "-all RoPE (fit+apply on rotated keys)": Mapper.fit(stats, k=best_k, lam=cfg.lam, score=score["mean"], key_space="rope"),
-                "-RoPE -cross-layer (rotated keys, k=1)": Mapper.fit(stats, k=1, lam=cfg.lam, score=score["mean"], key_space="rope"),
-                "-RoPE -cross-layer -ridge (rotated keys, k=1, lambda=0)": Mapper.fit(stats, k=1, lam=0.0, score=score["mean"], key_space="rope"),
+            unload_models()
+            astats = CalibrationStats.load(stats_dir, device=stats_device(), kinds=("Krope", "V"))
+            rope = {   # fitted on the rotated keys; selection still uses the content-space score
+                "-all RoPE (fit+apply on rotated keys)": Mapper.fit(astats, k=best_k, lam=cfg.lam, score=score["mean"], key_space="rope"),
+                "-RoPE -cross-layer (rotated keys, k=1)": Mapper.fit(astats, k=1, lam=cfg.lam, score=score["mean"], key_space="rope"),
+                "-RoPE -cross-layer -ridge (rotated keys, k=1, lambda=0)": Mapper.fit(astats, k=1, lam=0.0, score=score["mean"], key_space="rope"),
             }
+            del astats
+            _free()
             abl = {}
-            for name, m in variants.items():
-                r = evaluate(s, t, m, held, prefix_len=cfg.eval_seq_len - cfg.eval_suffix_len, suffix_len=cfg.eval_suffix_len)
+
+            def run_variant(name: str, m: Mapper) -> None:
+                r = evaluate(*models(), m, held_out(), **split)
                 abl[name] = {"attn_cosine_mean": r.attn_cosine_mean, "kl_mean": r.kl_mean, "top1_agreement": r.top1_agreement,
                              "r2_K": float(np.nanmean(r.r2_K)), "r2_V": float(np.nanmean(r.r2_V))}
                 log(f"[ablation] {name}: cosine {r.attn_cosine_mean:.3f} KL {r.kl_mean:.3f} top-1 {r.top1_agreement:.3f}")
+
+            # Table 2 rows, removed sequentially as in the paper
+            full = Mapper.load(mapper_dir(best_k))
+            run_variant("full (content-space)", full)
+            run_variant("-inference RoPE (content fit, no re-rotation)", full.ablate_inference_rope())
+            del full
+            _free()
+            for name in list(rope):
+                run_variant(name, rope.pop(name))
+                _free()
             _json(p, abl)
         report["stages"]["ablation"] = abl
 
     # ---- 6. reverse direction ------------------------------------------------------------------
-    reverse_mapper = None
+    rdir = out / "reverse"
+    have_reverse = False
     if "reverse" in cfg.stages and cfg.reverse and best_k is not None:
-        s, t, _ = models()
-        rdir = out / "reverse"
         rstats_dir = rdir / "stats"
-        if (rdir / "mapper" / "mapper.json").exists():
-            reverse_mapper = Mapper.load(rdir / "mapper")
-            rev = json.loads((rdir / "eval.json").read_text()) if (rdir / "eval.json").exists() else {}
-        else:
+        if not (rdir / "mapper" / "mapper.json").exists():
             if (rstats_dir / "meta.json").exists():
-                rstats = CalibrationStats.load(rstats_dir, device=cfg.stats_device)
+                unload_models()
+                rstats = CalibrationStats.load(rstats_dir, device=stats_device())
             else:
                 t0 = time.time()
-                rstats = calibrate(t, s, batches(sequences(cfg.n_seqs, cfg.seq_len), cfg.batch_size), stride=cfg.stride,
-                                   kinds=("K", "V"), stats_device=cfg.stats_device, source_name=cfg.target, target_name=cfg.source,
+                m_src, m_tgt = models()
+                rstats = calibrate(m_tgt, m_src, batches(sequences(cfg.n_seqs, cfg.seq_len), cfg.batch_size), stride=cfg.stride,
+                                   kinds=("K", "V"), stats_device=stats_device(), source_name=cfg.target, target_name=cfg.source,
                                    require_matched_kv=not cfg.allow_mismatched, progress=True)
+                del m_src, m_tgt
                 rstats.save(rstats_dir)
+                _release_page_cache(rstats_dir.glob("*.safetensors"))
                 log(f"[reverse] calibrated target->source in {time.time() - t0:.0f}s")
+                unload_models()
             k_rev = min(best_k, rstats.source.n_layers)
-            reverse_mapper = Mapper.fit(rstats, k=k_rev, lam=cfg.lam)
-            reverse_mapper.save(rdir / "mapper")
-            held = sequences(cfg.eval_n_seqs, cfg.eval_seq_len, skip=cfg.n_seqs)
-            r = evaluate(t, s, reverse_mapper, held, prefix_len=cfg.eval_seq_len - cfg.eval_suffix_len, suffix_len=cfg.eval_suffix_len)
-            rev = r.to_dict() | {"k": k_rev, "direction": f"{cfg.target} -> {cfg.source}"}
+            t0 = time.time()
+            rm = Mapper.fit(rstats, k=k_rev, lam=cfg.lam)
+            rm.save(rdir / "mapper")
+            _release_page_cache((rdir / "mapper").glob("*.safetensors"))
+            log(f"[reverse] fitted k={k_rev} in {time.time() - t0:.0f}s")
+            del rstats, rm
+            _free()
+        if (rdir / "eval.json").exists():
+            rev = json.loads((rdir / "eval.json").read_text())
+        else:
+            rm = Mapper.load(rdir / "mapper")
+            m_src, m_tgt = models()
+            r = evaluate(m_tgt, m_src, rm, held_out(), **split)
+            del m_src, m_tgt
+            rev = r.to_dict() | {"k": rm.k, "direction": f"{cfg.target} -> {cfg.source}"}
             _json(rdir / "eval.json", rev)
-            log(f"[reverse] L->S k={k_rev}: cosine {r.attn_cosine_mean:.3f} KL {r.kl_mean:.3f} top-1 {r.top1_agreement:.3f}")
-            del rstats
+            log(f"[reverse] L->S k={rm.k}: cosine {r.attn_cosine_mean:.3f} KL {r.kl_mean:.3f} top-1 {r.top1_agreement:.3f}")
+            del rm, r
+            _free()
+        have_reverse = True
         report["stages"]["reverse"] = {k: rev.get(k) for k in ("k", "direction", "attn_cosine_mean", "attn_cosine_min",
                                                                  "kl_mean", "kl_p95", "top1_agreement")} if rev else {}
 
     # ---- 7. bench -----------------------------------------------------------------------------
     if "bench" in cfg.stages and best_k is not None:
-        s, t, _ = models()
         p = out / "bench.json"
         if p.exists():
             rows = json.loads(p.read_text())
         else:
-            max_pos = int(getattr(getattr(t.config, "text_config", None) or t.config, "max_position_embeddings", 32768))
+            m = Mapper.load(mapper_dir(best_k))
+            t_cfg = models()[1].config
+            max_pos = int(getattr(getattr(t_cfg, "text_config", None) or t_cfg, "max_position_embeddings", 32768))
             lens = [n for n in cfg.bench_seq_lens if n <= max_pos]
             rows = []
             for n in lens:
                 with EnergyMeter() as em_m:
-                    r = benchmark(s, t, mappers[best_k], seq_lens=(n,), warmup=cfg.bench_warmup, trials=cfg.bench_trials)[0]
+                    r = benchmark(*models(), m, seq_lens=(n,), warmup=cfg.bench_warmup, trials=cfg.bench_trials)[0]
                 rows.append({"seq_len": n, "mapper_ms": r.mapper_ms, "reprefill_ms": r.reprefill_ms, "speedup": r.speedup,
                              "energy_both": em_m.reading.to_dict() if em_m.reading else None})
                 log(f"[bench] T={n}: mapper {r.mapper_ms:.1f} ms vs re-prefill {r.reprefill_ms:.1f} ms ({r.speedup:.1f}x)")
+                _free()
             _json(p, rows)
+            del m
+            _free()
         report["stages"]["bench"] = rows
 
     # ---- 8. multiturn -------------------------------------------------------------------------
     if "multiturn" in cfg.stages and best_k is not None:
-        s, t, _ = models()
         p = out / "multiturn.json"
         if p.exists():
             mt = json.loads(p.read_text())
         else:
             need = cfg.multiturn_turns * cfg.multiturn_turn_tokens
             doc = sequences(1, need, skip=cfg.n_seqs + cfg.eval_n_seqs)[0][None]
-            mt = multiturn_drift(s, t, mappers[best_k], doc, cfg.multiturn_turns, cfg.multiturn_turn_tokens,
-                                 mapper_ts=reverse_mapper)
+            m = Mapper.load(mapper_dir(best_k))
+            rm = Mapper.load(rdir / "mapper") if have_reverse else None
+            mt = multiturn_drift(*models(), m, doc, cfg.multiturn_turns, cfg.multiturn_turn_tokens, mapper_ts=rm)
             _json(p, mt)
             log(f"[multiturn] KL slope {mt['kl_slope_per_turn']} per turn")
+            del m, rm
+            _free()
         report["stages"]["multiturn"] = mt
 
     # ---- 9. report ----------------------------------------------------------------------------
+    if thermal.enabled():
+        report["thermal"] = thermal.summary()
+        log(f"[thermal] {report['thermal']}")
     report["seconds_total"] = time.time() - t_all
     _json(out / "report.json", report)
     (out / "report.md").write_text(format_report(report, cfg))

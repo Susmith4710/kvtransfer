@@ -29,6 +29,7 @@ from typing import Any, Sequence
 import torch
 import torch.nn.functional as F
 
+from . import thermal
 from .hf import forward_with_cache, load_model, prefill
 from .mapper import Mapper
 from .transfer import CrossModelTransfer, TransferResult, _pick
@@ -188,6 +189,7 @@ class TransferLM(HFLM):
         for request_str, context_enc, continuation_enc in requests:
             assert len(context_enc) > 0 and len(continuation_enc) > 0
             assert len(continuation_enc) <= self.max_length
+            thermal.checkpoint()
             answer = score_continuation(self.xfer, context_enc, continuation_enc, self.hold_back, self.device,
                                         max_length=self.max_length)
             res.append(answer)
@@ -206,6 +208,7 @@ class TransferLM(HFLM):
         pbar = tqdm(total=len(requests), disable=(disable_tqdm or (self.rank != 0)),
                     desc="Running generate_until requests (kvtransfer)")
         for req in requests:
+            thermal.checkpoint()
             context, gen_kwargs = req.args
             if not isinstance(gen_kwargs, dict):
                 raise TypeError(f"expected gen_kwargs dict, got {type(gen_kwargs)}")
@@ -311,26 +314,58 @@ def retention_table(results_transfer: dict, results_target: dict, results_source
 def run_harness(source: str, target: str, mapper: str, tasks: Sequence[str] | str, device: str = "cuda",
                 dtype: str = "auto", limit: int | float | None = None, hold_back: int = 1,
                 num_fewshot: int | None = None, batch_size: int | str = 1, metric: str | None = None,
-                **simple_evaluate_kwargs) -> dict:
+                cache_dir: str | None = None, **simple_evaluate_kwargs) -> dict:
     """Run ``lm_eval.simple_evaluate`` for target-only, source-only and transfer; return all three plus
-    :func:`retention_table` rows under ``"retention"``."""
+    :func:`retention_table` rows under ``"retention"``.  With ``cache_dir`` each evaluation's results are
+    written to ``<cache_dir>/{target,source,transfer}.json`` when it finishes and reused on a rerun."""
     _require_lm_eval()
+    import gc
+    import json
+    from pathlib import Path
+
     import lm_eval
 
     if isinstance(tasks, str):
         tasks = [t.strip() for t in tasks.split(",") if t.strip()]
     tasks = list(tasks)
-    common = dict(tasks=tasks, num_fewshot=num_fewshot, batch_size=batch_size, device=device, limit=limit,
-                  **simple_evaluate_kwargs)
-    res_target = lm_eval.simple_evaluate(model="hf", model_args={"pretrained": target, "dtype": dtype}, **common)
-    res_source = lm_eval.simple_evaluate(model="hf", model_args={"pretrained": source, "dtype": dtype}, **common)
-    res_xfer = lm_eval.simple_evaluate(
+    common = dict(tasks=tasks, num_fewshot=num_fewshot, limit=limit, **simple_evaluate_kwargs)
+
+    def cached(name: str, run):
+        """Each of the three evaluations is saved as soon as it finishes, so a rerun resumes after it."""
+        p = Path(cache_dir) / f"{name}.json" if cache_dir else None
+        if p is not None and p.exists():
+            return json.loads(p.read_text())
+        res = run()
+        if p is not None:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"results": res["results"]}, indent=2, default=str))
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return res
+
+    def baseline(pretrained: str):
+        # Built here rather than by name so the thermal governor (when configured) can pause between
+        # forward passes of the stock model; the instance is dropped before the next evaluation loads.
+        lm = HFLM(pretrained=pretrained, dtype=dtype, device=device, batch_size=batch_size)
+        if thermal.enabled():
+            lm.model.register_forward_pre_hook(_thermal_pre_hook)
+        return lm_eval.simple_evaluate(model=lm, **common)
+
+    res_target = cached("target", lambda: baseline(target))
+    res_source = cached("source", lambda: baseline(source))
+    res_xfer = cached("transfer", lambda: lm_eval.simple_evaluate(
         model="kvtransfer",
         model_args={"pretrained": target, "source": source, "mapper": mapper, "dtype": dtype, "hold_back": hold_back},
-        **common,
-    )
+        batch_size=batch_size, device=device, **common,
+    ))
     table = retention_table(res_xfer["results"], res_target["results"], res_source["results"], metric=metric)
     return {"target": res_target, "source": res_source, "transfer": res_xfer, "retention": table}
+
+
+def _thermal_pre_hook(module, args) -> None:
+    """Forward pre-hook: pause while the machine is hot.  Must return None so the inputs are untouched."""
+    thermal.checkpoint()
 
 
 def retention_summary(rows: list[dict]) -> dict:

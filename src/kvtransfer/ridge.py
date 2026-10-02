@@ -65,10 +65,10 @@ class MomentAccumulator:
             cols = cols.to(self.device)
         g = self.gram if rows is None else self.gram[rows][:, rows]
         c = self.cross
+        if cols is not None:   # columns first: the intermediate is p x |cols| instead of |rows| x q
+            c = c[:, cols]
         if rows is not None:
             c = c[rows]
-        if cols is not None:
-            c = c[:, cols]
         dxr = dx if rows is None else dx[rows]
         dyc = dy if cols is None else dy[cols]
         yy = self.yy if cols is None else self.yy[cols]
@@ -88,11 +88,13 @@ class MomentAccumulator:
         gxx, gxy, syy, mx, my = self.centered(rows, cols)
         gxx = gxx.to(solve_dtype)
         gxy = gxy.to(solve_dtype)
-        a = gxx + lam * torch.eye(gxx.shape[0], device=gxx.device, dtype=solve_dtype)
+        a = gxx.clone()
+        a.diagonal().add_(lam)          # gxx + lam * I without materialising the identity
         try:
             w = torch.linalg.solve(a, gxy)
         except RuntimeError:
             w = torch.linalg.lstsq(a, gxy).solution
+        del a
         # per-column SS_res_c = syy_c - 2 (Wᵀ XcᵀYc)_cc + (Wᵀ XcᵀXc W)_cc ; pooled R^2 sums the columns
         ss_res_c = syy.double() - 2.0 * (w * gxy).sum(0) + (w * (gxx @ w)).sum(0)
         ss_tot = float(syy.double().sum())
@@ -102,6 +104,62 @@ class MomentAccumulator:
         w = w.to(self.dtype)
         b = my - mx @ w
         return w, b, r2
+
+    def _trim(self) -> None:
+        """Return freed CUDA blocks to the system (a no-op on CPU)."""
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def solve_shared(self, lam: float, rows: torch.Tensor, col_blocks, solve_dtype=torch.float64):
+        """Ridge for several target column blocks that share the same source ``rows``.
+
+        The regularised Gram ``Xc^T Xc + lambda I`` depends only on the source rows, so it is
+        LU-factored once and every block costs one back-substitution.  Yields, per block,
+        ``(W, b, r2, (ss_res_c, syy_c))``: what :meth:`solve` returns for that block plus its
+        ``last_column_residuals``, equal up to floating-point rounding.  With k = all source layers
+        every target layer shares one Gram, so a fit needs 2 factorisations instead of 2 * L_t.
+        A singular Gram (possible with ``lam = 0``) falls back to :meth:`solve` per block.
+        """
+        col_blocks = list(col_blocks)
+        rows_d = rows.to(self.device)
+        dx = (self.sum_x / self.n).to(self.dtype)
+        dy = (self.sum_y / self.n).to(self.dtype)
+        dxr = dx[rows_d]
+        # Memory matters here: with k = all the block is the whole Gram (11 GiB in fp64 for a 36-layer
+        # 8x128 source).  One gather, an in-place centring, one fp64 copy and its LU factor are all that
+        # is ever alive; cached blocks are handed back so they do not pile up next to the statistics.
+        a = self.gram[rows_d[:, None], rows_d[None, :]]
+        a.addr_(dxr, dxr, alpha=-float(self.n))             # centred Gram, same arithmetic as centered()
+        a = a.to(solve_dtype)
+        self._trim()
+        a.diagonal().add_(lam)
+        lu, piv, info = torch.linalg.lu_factor_ex(a)
+        del a
+        self._trim()
+        if int(info) != 0:
+            del lu, piv
+            self._trim()
+            for cols in col_blocks:
+                w, b, r2 = self.solve(lam, rows=rows, cols=cols, solve_dtype=solve_dtype)
+                yield w, b, r2, self.last_column_residuals
+            return
+        mx = dxr + self.shift_x[rows_d]
+        for cols in col_blocks:
+            cols_d = cols.to(self.device)
+            dyc = dy[cols_d]
+            gxy = (self.cross[:, cols_d][rows_d] - self.n * torch.outer(dxr, dyc)).to(solve_dtype)
+            syy = (self.yy[cols_d] - self.n * dyc.double() ** 2).to(self.dtype)
+            w = torch.linalg.lu_solve(lu, piv, gxy)
+            # At the solution (Gxx + lam I) W = Gxy, so W^T Gxx W = W^T Gxy - lam W^T W: the residual
+            # needs neither the Gram nor an O(n^2) product.
+            ss_res_c = syy.double() - (w * gxy).sum(0) - lam * (w * w).sum(0)
+            ss_tot = float(syy.double().sum())
+            ss_res = float(ss_res_c.sum())
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+            w = w.to(self.dtype)
+            b = (dyc + self.shift_y[cols_d]) - mx @ w
+            yield w, b, r2, (ss_res_c.cpu(), syy.double().cpu())
 
     @staticmethod
     def block_r2(ss_res_c: torch.Tensor, syy_c: torch.Tensor, block: int) -> list[float]:

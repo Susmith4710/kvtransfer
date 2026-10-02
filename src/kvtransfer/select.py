@@ -9,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from . import thermal
 from .calibration import CalibrationStats
 
 
@@ -33,6 +34,7 @@ def probe_r2(stats: CalibrationStats, kind: str, lam: float = 0.0) -> np.ndarray
                 _, _, r2 = acc.solve(lam, rows=rows, cols=stats.tgt_cols(lt, h))
                 vals.append(r2)
             out[ls, lt] = float(np.mean(vals))
+        thermal.checkpoint()
     return out
 
 

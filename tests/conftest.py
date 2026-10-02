@@ -1,6 +1,10 @@
 """Tiny random-init models so the suite runs offline on CPU in seconds."""
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("KVT_THERMAL_PAUSE_C", "off")   # the governor auto-enables on a GB10; keep tests hermetic
+
 import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM, Qwen3Config, Qwen3ForCausalLM
