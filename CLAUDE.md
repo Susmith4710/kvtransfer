@@ -73,6 +73,11 @@ Local checkpoint paths can be passed anywhere an HF id is accepted. `kvtransfer 
 * **Tier 1 has run on the real pair** (Qwen3-4B -> Qwen3-8B, 2026-10-01). Results and how they
   compare with the paper are in `docs/RESULTS_TIER1.md`; raw outputs are under
   `runs/qwen3-4b-to-8b/` (not committed). Best k is 12 by held-out attention-output cosine (0.899).
+* **A pair with a real quality gap has also run** (Qwen3-1.7B -> Qwen3-8B, 2026-10-02):
+  `docs/RESULTS_GAP_PAIR.md`. Retention is 86.4 %, but the source alone is already 83 % of the target,
+  so the transfer recovers only about a fifth of the gap: the large model decoding from the mapped
+  cache scores close to the small model. Always report source-alone accuracy next to retention.
+  Untested levers: a longer natively processed tail (`--hold-back`), k = 16 or 20, the MLP mapper.
 * Tier 2 (Qwen2.5-7B -> 14B, mismatched KV) and Tier 3 (`kvtransfer serve`) have not run. Tier 2
   needs the bf16 Hugging Face checkpoints, which are not on disk (the pod uses AWQ builds).
 * The experiment runner is memory-disciplined for unified memory: models are unloaded during ridge

@@ -42,6 +42,8 @@ pytest kvtransfer                    # offline CPU suite, tiny random models, ~3
   Ollama/GGUF cannot be used directly, prefix sharing, the escalation server, what integration would look like.
 * `docs/PAPER_VERIFICATION.md`: every paper claim mapped to the code and to the test that checks it.
 * `docs/RESULTS_TIER1.md`: the first real-model results (Qwen3-4B → Qwen3-8B on the Spark) against the paper.
+* `docs/RESULTS_GAP_PAIR.md`: a pair with a real quality gap (Qwen3-1.7B → Qwen3-8B). The transfer lands near the
+  small model's accuracy; read this before relying on the retention figure.
 * `scripts/dgx_spark/run_tiers.sh`: the three tiers end to end.
 
 ```bash
